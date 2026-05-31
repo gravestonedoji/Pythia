@@ -23,8 +23,46 @@ MODEL_REVIEW = "claude-opus-4-8"     # weekly self-review (v1+), highest-leverag
 MODEL_TRIAGE = "claude-haiku-4-5"    # high-volume extraction/tagging (v1+), cheap and fast
 
 # --- Watchlist ---------------------------------------------------------------
-# Broad-based, highly liquid ETFs only. No single stocks, no single-stock ETFs.
-WATCHLIST: list[str] = ["SPY", "QQQ", "IWM"]
+# Broad-based / liquid ETFs only. No single stocks, no single-stock ETFs.
+# Deliberately spread across distinct return drivers so the track record isn't
+# three correlated bets: US large/tech/small, semis, defense, cyber, crypto
+# (BTC + ETH), oil, gold, and long-duration rates.
+WATCHLIST: list[str] = [
+    "SPY", "QQQ", "IWM",          # US large / tech / small cap
+    "SOXX",                        # semiconductors
+    "ITA",                         # aerospace & defense
+    "CIBR",                        # cybersecurity
+    "IBIT", "ETHA",               # spot bitcoin / ether
+    "USO",                         # crude oil
+    "GLD",                         # gold
+    "TLT",                         # 20+yr Treasuries (rates/duration)
+]
+
+# --- Asset classes -----------------------------------------------------------
+# Used only to pick the forecaster's *directional prior* (see forecaster.py).
+# Broad equity ETFs carry a real structural long-run up-drift (the equity risk
+# premium) — a data-free, NON-macro prior worth giving the model. Commodities,
+# bonds, and crypto funds have no such reliable drift, so handing them an equity
+# up-bias would hurt calibration; their neutral anchor is 0.50. This is not a
+# macro view and stays within the price-only ablation.
+EQUITY = "equity"
+NON_EQUITY = "non_equity"
+
+ASSET_CLASS: dict[str, str] = {
+    "SPY": EQUITY, "QQQ": EQUITY, "IWM": EQUITY,
+    "SOXX": EQUITY, "ITA": EQUITY, "CIBR": EQUITY,
+    "IBIT": NON_EQUITY, "ETHA": NON_EQUITY,
+    "USO": NON_EQUITY, "GLD": NON_EQUITY, "TLT": NON_EQUITY,
+}
+
+
+def asset_class(ticker: str) -> str:
+    """Asset class for the directional prior.
+
+    Defaults to NON_EQUITY (the neutral, no-drift prior) for anything unmapped,
+    so we only ever assert an up-drift where we know the asset is broad equity.
+    """
+    return ASSET_CLASS.get(ticker.upper(), NON_EQUITY)
 
 # --- Forecast defaults -------------------------------------------------------
 # Horizon is measured in *trading sessions*, resolved via a real exchange

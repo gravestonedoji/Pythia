@@ -20,7 +20,7 @@ import pandas as pd
 
 from . import config, data
 
-_SYSTEM_PROMPT = """\
+_SYSTEM_TEMPLATE = """\
 You are Pythia, a disciplined short-horizon market forecaster. You produce \
 *calibrated* probabilities for falsifiable claims about liquid, broad-based \
 ETFs, using ONLY the price and volume data provided to you.
@@ -33,15 +33,37 @@ curve, earnings, jobs numbers, elections, geopolitics, or any other macro or \
 news. You do NOT have today's values for any of these. Any such knowledge from \
 your training is STALE, and using it is worse than ignoring it: a confident \
 guess about today's macro from old data is a trap. Do not use it or mention it.
-- Be calibrated, not dramatic. If the price data shows no real edge, your \
-probability should sit near the asset's natural drift (broad equity ETFs close \
-up slightly more than half the time). Reserve confident probabilities for \
-genuinely strong, clear price signals. Avoid false precision.
+- Be calibrated, not dramatic. {drift_prior} Reserve confident probabilities \
+for genuinely strong, clear price signals. Avoid false precision.
 - "probability" is your probability that the claim is TRUE over the stated \
 horizon, as a number between 0 and 1.
 
 Submit your answer by calling the submit_forecast tool. Keep the reasoning \
 concise (a few sentences) and grounded only in the provided price action."""
+
+
+# The neutral directional prior depends on the asset class. Broad equity ETFs
+# have a structural long-run up-drift (a data-free, non-macro fact); commodities,
+# bonds, and crypto funds do not, so they must not be nudged upward.
+_DRIFT_PRIOR = {
+    config.EQUITY: (
+        "If the price data shows no real edge, your probability should sit near "
+        "this asset's natural drift: broad equity ETFs close up slightly more "
+        "often than not, so a touch above 0.50 is the right neutral anchor."
+    ),
+    config.NON_EQUITY: (
+        "If the price data shows no real edge, your probability should sit near "
+        "0.50: this asset (a commodity, bond, or crypto fund) has NO reliable "
+        "directional drift, so do not assume any upward bias — let the price "
+        "action alone move you off 0.50, in either direction."
+    ),
+}
+
+
+def build_system_prompt(asset_cls: str) -> str:
+    """System prompt with the directional prior matched to the asset class."""
+    prior = _DRIFT_PRIOR.get(asset_cls, _DRIFT_PRIOR[config.NON_EQUITY])
+    return _SYSTEM_TEMPLATE.format(drift_prior=prior)
 
 _TOOL = {
     "name": "submit_forecast",
@@ -132,7 +154,7 @@ def forecast(
     response = client.messages.create(
         model=model,
         max_tokens=1024,
-        system=_SYSTEM_PROMPT,
+        system=build_system_prompt(config.asset_class(ticker)),
         tools=[_TOOL],
         tool_choice={"type": "tool", "name": "submit_forecast"},
         messages=[{"role": "user", "content": user_prompt}],
