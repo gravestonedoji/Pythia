@@ -263,5 +263,65 @@ def review(
     console.print(call_log)
 
 
+# --- why ---------------------------------------------------------------------
+
+@app.command()
+def why(
+    ticker: Optional[str] = typer.Option(None, "--ticker", "-t", help="Only show this ticker."),
+    on: Optional[str] = typer.Option(
+        None, "--date", help="Show the batch issued on this date (default: the latest)."
+    ),
+    all_batches: bool = typer.Option(
+        False, "--all", help="Show every batch, not just the most recent one."
+    ),
+) -> None:
+    """Show Pythia's predictions with the reasoning behind each one."""
+    conn = storage.get_connection()
+    rows = [r for r in storage.fetch_all(conn) if r["forecaster"] == config.PYTHIA]
+    if ticker:
+        rows = [r for r in rows if r["ticker"] == ticker.upper()]
+    if not rows:
+        console.print("[dim]No Pythia forecasts logged yet. Run a forecast first.[/dim]")
+        return
+
+    issue_dates = sorted({r["issued_at"][:10] for r in rows}, reverse=True)
+    if on:
+        keep = {on}
+    elif all_batches:
+        keep = set(issue_dates)
+    else:
+        keep = {issue_dates[0]}
+
+    shown = [r for r in rows if r["issued_at"][:10] in keep]
+    if not shown:
+        console.print(f"[dim]No Pythia forecasts issued on {on}.[/dim]")
+        return
+
+    # Newest batch first; within a batch, most bullish (highest P) first.
+    for d in sorted({r["issued_at"][:10] for r in shown}, reverse=True):
+        batch = sorted(
+            (r for r in shown if r["issued_at"][:10] == d),
+            key=lambda r: -r["probability"],
+        )
+        console.print(
+            f"\n[bold]Pythia predictions issued {d}[/bold]  "
+            "[dim](P(up) = chance the ETF closes at or above its anchor price)[/dim]"
+        )
+        for r in batch:
+            verdict = ""
+            if r["status"] == "resolved":
+                if r["outcome"] == 1.0:
+                    verdict = "   [green]came TRUE[/green]"
+                else:
+                    verdict = "   [red]came FALSE[/red]"
+            console.print(
+                f"\n[bold cyan]{r['ticker']}[/bold cyan]  "
+                f"P(up) = {r['probability'] * 100:.1f}%   "
+                f"[dim]resolves {r['resolves_on']}[/dim]{verdict}"
+            )
+            # markup=False so any brackets in the model's text are shown literally.
+            console.print(f"  {r['reasoning']}", style="dim", markup=False)
+
+
 if __name__ == "__main__":
     app()
