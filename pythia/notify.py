@@ -27,6 +27,8 @@ class Prediction:
 
     ticker: str
     probability: float  # P(up) over the horizon, 0..1
+    anchor_date: str    # ISO date of the anchor session (when the call was made)
+    anchor_close: float # the price at that time; the level the claim is measured against
     resolves_on: str    # ISO date the claim is graded
     reasoning: str
 
@@ -50,12 +52,14 @@ def format_body(
         f"Pythia predictions issued {issued_on}",
         f"P(up) = chance the ETF closes at or above its anchor price over "
         f"{horizon_days} trading sessions.",
+        "'anchor' is the price when the call was made — what the claim is measured against.",
         "",
     ]
     for p in sorted(predictions, key=lambda r: -r.probability):
         lines.append(
             f"{_direction(p.probability):<4} {p.ticker:<5} "
-            f"P(up) {p.probability * 100:5.1f}%   resolves {p.resolves_on}"
+            f"P(up) {p.probability * 100:5.1f}%   "
+            f"anchor {p.anchor_close:.2f} ({p.anchor_date})   resolves {p.resolves_on}"
         )
         if p.reasoning:
             lines.append(f"     {p.reasoning}")

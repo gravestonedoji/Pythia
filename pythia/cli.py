@@ -138,6 +138,7 @@ def forecast(
                     if fc.forecaster == config.PYTHIA:
                         notifications.append(notifier.Prediction(
                             ticker=fc.ticker, probability=fc.probability,
+                            anchor_date=fc.anchor_date, anchor_close=fc.anchor_close,
                             resolves_on=fc.resolves_on, reasoning=fc.reasoning or "",
                         ))
                 label = config.FORECASTER_LABELS.get(fc.forecaster, fc.forecaster)
@@ -393,6 +394,7 @@ def notify(
     preds = [
         notifier.Prediction(
             ticker=r["ticker"], probability=r["probability"],
+            anchor_date=r["anchor_date"], anchor_close=r["anchor_close"],
             resolves_on=r["resolves_on"], reasoning=r["reasoning"] or "",
         )
         for r in batch

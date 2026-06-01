@@ -14,12 +14,15 @@ from pythia import config, notify
 
 def _preds() -> list[notify.Prediction]:
     return [
-        notify.Prediction(ticker="SPY", probability=0.62, resolves_on="2026-06-09",
-                           reasoning="Uptrend intact."),
-        notify.Prediction(ticker="TLT", probability=0.41, resolves_on="2026-06-09",
-                           reasoning="Rolling over."),
-        notify.Prediction(ticker="GLD", probability=0.50, resolves_on="2026-06-09",
-                           reasoning="No edge."),
+        notify.Prediction(ticker="SPY", probability=0.62, anchor_date="2026-06-01",
+                          anchor_close=595.20, resolves_on="2026-06-09",
+                          reasoning="Uptrend intact."),
+        notify.Prediction(ticker="TLT", probability=0.41, anchor_date="2026-06-01",
+                          anchor_close=88.10, resolves_on="2026-06-09",
+                          reasoning="Rolling over."),
+        notify.Prediction(ticker="GLD", probability=0.50, anchor_date="2026-06-01",
+                          anchor_close=312.45, resolves_on="2026-06-09",
+                          reasoning="No edge."),
     ]
 
 
@@ -44,6 +47,8 @@ def test_body_sorted_most_bullish_first_and_includes_fields():
     # Direction + reasoning both present.
     assert "UP" in body and "DOWN" in body
     assert "Uptrend intact." in body
+    # The anchor price (latest price when the call was made) is shown.
+    assert "595.20" in body
     # No live-order language leaks in — it's surfacing only.
     assert "no orders placed" in body
 
