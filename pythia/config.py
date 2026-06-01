@@ -7,6 +7,7 @@ defaults. Everything tunable lives here so it can be swapped in one place.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -118,3 +119,45 @@ def db_path() -> Path:
     if override:
         return Path(override)
     return _PROJECT_ROOT / "pythia.db"
+
+
+# --- Email alerts (optional; roadmap v3, pulled forward) ---------------------
+# Surfacing-only: Pythia can email a summary of each batch of predictions right
+# after it logs them, so a human can see what was called and in which direction.
+# This stays on the forecasting side of the hard wall — it never places or
+# suggests a live order. Every value comes from the environment so the SMTP
+# password is never committed (see .env.example). Defaults target Gmail.
+SMTP_HOST_DEFAULT = "smtp.gmail.com"
+SMTP_PORT_DEFAULT = 587  # STARTTLS
+
+
+@dataclass(frozen=True)
+class EmailConfig:
+    host: str
+    port: int
+    user: str
+    password: str
+    sender: str
+    recipient: str
+
+
+def email_config() -> EmailConfig | None:
+    """Email settings from the environment, or None if not configured.
+
+    Requires at least PYTHIA_SMTP_USER and PYTHIA_SMTP_PASSWORD; sender and
+    recipient default to the SMTP user (i.e. email yourself) when left unset.
+    Returning None lets callers treat alerting as an optional no-op.
+    """
+    user = os.environ.get("PYTHIA_SMTP_USER", "").strip()
+    password = os.environ.get("PYTHIA_SMTP_PASSWORD", "").strip()
+    if not user or not password:
+        return None
+    host = os.environ.get("PYTHIA_SMTP_HOST", "").strip() or SMTP_HOST_DEFAULT
+    port_raw = os.environ.get("PYTHIA_SMTP_PORT", "").strip()
+    port = int(port_raw) if port_raw else SMTP_PORT_DEFAULT
+    sender = os.environ.get("PYTHIA_EMAIL_FROM", "").strip() or user
+    recipient = os.environ.get("PYTHIA_EMAIL_TO", "").strip() or user
+    return EmailConfig(
+        host=host, port=port, user=user, password=password,
+        sender=sender, recipient=recipient,
+    )

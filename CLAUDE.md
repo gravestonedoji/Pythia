@@ -29,8 +29,10 @@ built so each added data layer can be *measured* against the simpler one.
    review and place **manually**. Keep a hard architectural wall between
    "forecast/grade" (automated) and "execute real money" (human-only). Do not
    add any live-broker order placement.
-3. **Secrets in `.env`, never committed.** The only secret for v0 is
-   `ANTHROPIC_API_KEY`. `.env` and `*.db` are gitignored.
+3. **Secrets in `.env`, never committed.** `ANTHROPIC_API_KEY` is the only
+   *required* secret. Optional email alerts add SMTP credentials
+   (`PYTHIA_SMTP_*` / `PYTHIA_EMAIL_*`) — also `.env`-only, and a clean no-op
+   when unset. `.env` and `*.db` are gitignored.
 
 ## v0 design notes (important)
 
@@ -74,11 +76,14 @@ built so each added data layer can be *measured* against the simpler one.
 uv run pythia forecast    # form + log one forecast per watchlist ticker (Pythia + baselines)
 uv run pythia resolve     # settle matured forecasts against the real close and score them
 uv run pythia review      # print the track record, side by side with the baselines
+uv run pythia notify      # email a forecast batch (re-send the latest, or --test SMTP)
 uv run pytest             # run the scoring + calendar tests
 ```
 
-`forecast` needs `ANTHROPIC_API_KEY` (copy `.env.example` to `.env`). `resolve`
-and `review` do not.
+`forecast` needs `ANTHROPIC_API_KEY` (copy `.env.example` to `.env`). `resolve`,
+`review`, and `notify` do not (but `notify` needs the optional `PYTHIA_SMTP_*`
+vars set, or it's a no-op). `forecast` also emails the batch automatically when
+SMTP is configured; pass `--no-notify` to skip.
 
 ## Layout
 
@@ -90,8 +95,9 @@ pythia/
   forecaster.py  the brain: Anthropic call + price-only prompt (forbids macro)
   baselines.py   the reference-forecaster ladder
   scoring.py     resolution + Brier (pure core, unit-tested)
-  cli.py         typer CLI: forecast / resolve / review
-tests/           scoring + calendar tests (offline, no network/key)
+  notify.py      optional email alerts (surfacing-only; SMTP via stdlib)
+  cli.py         typer CLI: forecast / resolve / review / why / notify
+tests/           scoring + calendar + notify tests (offline, no network/key)
 ```
 
 ## Roadmap (build v0 first; don't jump ahead)
@@ -102,5 +108,7 @@ tests/           scoring + calendar tests (offline, no network/key)
 - **v2** — simulated liquid ETF option positions, marked to market (still
   simulated only).
 - **v3** — daily digest + alerting (email/Telegram/Discord), flagging only
-  high-conviction calls for manual review.
+  high-conviction calls for manual review. *Started early:* `notify.py` already
+  emails each forecast batch (see `pythia notify`); the high-conviction
+  filtering + digest framing is still to come.
 - **v4** — auto-published dashboard with the live track record + calibration curve.

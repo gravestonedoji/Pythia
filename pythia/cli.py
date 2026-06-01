@@ -29,6 +29,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import baselines, config, data, forecaster, scoring, storage
+from . import notify as notifier  # aliased: the `notify` command below would shadow it
 from .storage import Forecast
 
 app = typer.Typer(
@@ -64,9 +65,14 @@ def forecast(
     horizon: int = typer.Option(
         config.DEFAULT_HORIZON_DAYS, "--horizon", "-h", help="Horizon in trading sessions."
     ),
+    notify: bool = typer.Option(
+        True, "--notify/--no-notify",
+        help="Email a summary of the predictions made (if SMTP is configured in .env).",
+    ),
 ) -> None:
     """Form and log one forecast per ticker, for Pythia and every baseline."""
     tickers = ticker or config.WATCHLIST
+    notifications: list[notifier.Prediction] = []
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
         console.print(
@@ -129,6 +135,11 @@ def forecast(
                 else:
                     issued += 1
                     state = "[green]logged[/green]"
+                    if fc.forecaster == config.PYTHIA:
+                        notifications.append(notifier.Prediction(
+                            ticker=fc.ticker, probability=fc.probability,
+                            resolves_on=fc.resolves_on, reasoning=fc.reasoning or "",
+                        ))
                 label = config.FORECASTER_LABELS.get(fc.forecaster, fc.forecaster)
                 table.add_row(label, f"{fc.probability * 100:.1f}%", state)
             console.print(table)
@@ -137,6 +148,22 @@ def forecast(
             console.print(f"  [red]{tk}: {exc}[/red]")
 
     console.print(f"\n[bold green]Done.[/bold green] {issued} logged, {skipped} already present.")
+
+    # Email is best-effort: a logged run must never fail because alerting did.
+    if notify and notifications:
+        try:
+            sent = notifier.notify_predictions(
+                notifications, issued_on=date.today().isoformat(), horizon_days=horizon,
+            )
+            if sent:
+                console.print(f"[green]Emailed {len(notifications)} prediction(s).[/green]")
+            else:
+                console.print(
+                    "[dim]Email not configured — set PYTHIA_SMTP_USER and "
+                    "PYTHIA_SMTP_PASSWORD in .env to receive prediction alerts.[/dim]"
+                )
+        except Exception as exc:  # noqa: BLE001 - alerting must not break a logged run
+            console.print(f"[yellow]Forecasts logged, but the email failed: {exc}[/yellow]")
 
 
 # --- resolve -----------------------------------------------------------------
@@ -321,6 +348,59 @@ def why(
             )
             # markup=False so any brackets in the model's text are shown literally.
             console.print(f"  {r['reasoning']}", style="dim", markup=False)
+
+
+# --- notify ------------------------------------------------------------------
+
+@app.command()
+def notify(
+    on: Optional[str] = typer.Option(
+        None, "--date", help="Email the Pythia batch issued on this date (default: the latest)."
+    ),
+    test: bool = typer.Option(
+        False, "--test", help="Send a tiny test email to confirm SMTP works, then exit."
+    ),
+) -> None:
+    """Email a summary of a Pythia forecast batch (re-send an existing batch, or --test SMTP)."""
+    if config.email_config() is None:
+        console.print(
+            "[red]Email not configured.[/red] Set PYTHIA_SMTP_USER and "
+            "PYTHIA_SMTP_PASSWORD (optionally PYTHIA_EMAIL_TO) in .env. See .env.example."
+        )
+        raise typer.Exit(code=1)
+
+    if test:
+        notifier.send_email(
+            "Pythia - test email",
+            "If you can read this, Pythia's email alerts are configured correctly.",
+        )
+        console.print("[green]Test email sent.[/green]")
+        return
+
+    conn = storage.get_connection()
+    rows = [r for r in storage.fetch_all(conn) if r["forecaster"] == config.PYTHIA]
+    if not rows:
+        console.print("[dim]No Pythia forecasts logged yet. Run `pythia forecast` first.[/dim]")
+        raise typer.Exit(code=1)
+
+    issue_dates = sorted({r["issued_at"][:10] for r in rows}, reverse=True)
+    target = on or issue_dates[0]
+    batch = [r for r in rows if r["issued_at"][:10] == target]
+    if not batch:
+        console.print(f"[dim]No Pythia forecasts issued on {target}.[/dim]")
+        raise typer.Exit(code=1)
+
+    preds = [
+        notifier.Prediction(
+            ticker=r["ticker"], probability=r["probability"],
+            resolves_on=r["resolves_on"], reasoning=r["reasoning"] or "",
+        )
+        for r in batch
+    ]
+    notifier.notify_predictions(
+        preds, issued_on=target, horizon_days=batch[0]["horizon_days"],
+    )
+    console.print(f"[green]Emailed {len(preds)} prediction(s) from {target}.[/green]")
 
 
 if __name__ == "__main__":
