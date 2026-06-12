@@ -26,17 +26,29 @@ MODEL_TRIAGE = "claude-haiku-4-5"    # high-volume extraction/tagging (v1+), che
 # --- Watchlist ---------------------------------------------------------------
 # Broad-based / liquid ETFs only. No single stocks, no single-stock ETFs.
 # Deliberately spread across distinct return drivers so the track record isn't
-# three correlated bets: US large/tech/small, semis, defense, cyber, crypto
-# (BTC + ETH), oil, gold, and long-duration rates.
+# a handful of correlated bets. 30 tickers: more graded forecasts per calendar
+# week = statistical significance arrives sooner (the binding constraint on the
+# whole project is evidence per week, not model quality).
 WATCHLIST: list[str] = [
-    "SPY", "QQQ", "IWM",          # US large / tech / small cap
+    # US broad equity
+    "SPY", "QQQ", "IWM", "DIA",
+    # US sectors (SPDRs)
+    "XLF", "XLE", "XLK", "XLV", "XLI", "XLP", "XLU", "XLB",
+    # US industry / theme
     "SOXX",                        # semiconductors
     "ITA",                         # aerospace & defense
     "CIBR",                        # cybersecurity
+    "VNQ",                         # real estate (REITs)
+    # International equity
+    "EFA", "EEM", "EWJ",          # developed / emerging / Japan (broad baskets)
+    "FXI", "EWZ",                 # China / Brazil (single-country)
+    # Bonds / credit
+    "TLT", "IEF",                 # 20+yr / 7-10yr Treasuries
+    "HYG", "LQD",                 # high-yield / IG credit
+    # Commodities
+    "GLD", "SLV", "USO",          # gold / silver / crude oil
+    # Crypto
     "IBIT", "ETHA",               # spot bitcoin / ether
-    "USO",                         # crude oil
-    "GLD",                         # gold
-    "TLT",                         # 20+yr Treasuries (rates/duration)
 ]
 
 # --- Asset classes -----------------------------------------------------------
@@ -49,11 +61,21 @@ WATCHLIST: list[str] = [
 EQUITY = "equity"
 NON_EQUITY = "non_equity"
 
+# Conservative mapping. EQUITY (structural up-drift prior) only for broad,
+# diversified equity baskets. Deliberately NON_EQUITY despite being stocks:
+# FXI/EWZ (single-country EM — no reliable drift) and VNQ/HYG/LQD (heavy
+# distributions — on RAW closes, ex-dividend drops eat much of the drift, so a
+# price-only up-bias would be miscalibrated for the "close >= anchor" claim).
 ASSET_CLASS: dict[str, str] = {
-    "SPY": EQUITY, "QQQ": EQUITY, "IWM": EQUITY,
+    "SPY": EQUITY, "QQQ": EQUITY, "IWM": EQUITY, "DIA": EQUITY,
+    "XLF": EQUITY, "XLE": EQUITY, "XLK": EQUITY, "XLV": EQUITY,
+    "XLI": EQUITY, "XLP": EQUITY, "XLU": EQUITY, "XLB": EQUITY,
     "SOXX": EQUITY, "ITA": EQUITY, "CIBR": EQUITY,
+    "EFA": EQUITY, "EEM": EQUITY, "EWJ": EQUITY,
+    "VNQ": NON_EQUITY, "FXI": NON_EQUITY, "EWZ": NON_EQUITY,
+    "TLT": NON_EQUITY, "IEF": NON_EQUITY, "HYG": NON_EQUITY, "LQD": NON_EQUITY,
+    "GLD": NON_EQUITY, "SLV": NON_EQUITY, "USO": NON_EQUITY,
     "IBIT": NON_EQUITY, "ETHA": NON_EQUITY,
-    "USO": NON_EQUITY, "GLD": NON_EQUITY, "TLT": NON_EQUITY,
 }
 
 
@@ -87,6 +109,72 @@ MOMENTUM_LOOKBACK_SESSIONS = 5
 # Kept modest on purpose — a dumb rule shouldn't be maximally confident.
 MOMENTUM_CONFIDENCE = 0.60
 
+# --- HMM quant-bar baseline (hmm_baseline.py) ---------------------------------
+# The fourth baseline: a Gaussian HMM regime filter fitted per ticker, strictly
+# point-in-time. It needs YEARS of history (unlike the other baselines), so it
+# does its own deeper fetch rather than reusing the 180-day forecast window.
+HMM_LOOKBACK_DAYS = 3650          # calendar days of history to fetch (~10y)
+HMM_STATES = 3                    # regimes when history is rich (calm-up/churn/stress)
+HMM_RICH_HISTORY_SESSIONS = 750   # below this many sessions, drop to 2 states
+HMM_MIN_SESSIONS = 300            # below this, refuse to fit (young funds e.g. ETHA)
+HMM_MC_PATHS = 20_000             # Monte-Carlo paths for the horizon probability
+
+# --- HMM fit-health monitoring (hmm_health.py) ---------------------------------
+# The quant bar is the deploy gate, so a silently broken referee corrupts every
+# leaderboard comparison against it. Every fit is recorded and judged: EM that
+# exhausts its iterations without meeting tolerance, or parameters that jump
+# beyond these thresholds between consecutive refits, taint that day's value.
+# Policy (decided 2026-06-12): log + flag — a tainted value STAYS on the
+# leaderboard, visibly annotated; dropping it would bias the bar toward the
+# days where fitting is easy. Thresholds are sized so one new observation on
+# thousands can't trip them — a trip means EM landed in a different optimum.
+HMM_STABILITY_MAX_GAP_DAYS = 7    # only compare fits this close (calendar days)
+HMM_DURATION_JUMP_RATIO = 3.0     # expected regime duration ratio between refits
+HMM_SIGMA_JUMP_RATIO = 1.5        # per-state vol ratio between refits
+HMM_MU_JUMP_ABS = 0.0010          # per-state mean daily log-return shift (10 bps)
+
+# Retro-annotation only (`hmm-health --backfill`): a reconstructed fit must
+# land within this much of the logged probability to be trusted as THE fit
+# behind the row. Bit-exactness is unattainable — Yahoo quietly revises closes
+# deep in history and a still-moving (non-converged) EM amplifies them into
+# ~1e-4 output drift — while a different EM basin moves the output by whole
+# percentage points, far past this line.
+HMM_RECONSTRUCTION_TOL = 1e-3
+
+# --- Kalshi market-implied baseline (kalshi.py) -------------------------------
+# Read-only public market data; no account, no key, no orders — strictly on the
+# forecast/grade side of the hard wall. Odds are a BASELINE COLUMN only and must
+# never reach the forecaster prompt (Delphi anchoring experiment, §13.3).
+KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+
+# Whitelisted series per ticker, tried in order. Only series that settle on the
+# OFFICIAL CLOSE (or, for BTC, the 5pm benchmark print) — hourly/intraday series
+# are deliberately excluded. Dormant series cost one cheap empty request and are
+# harmless to keep listed (Kalshi rotates weekly/monthly listings).
+KALSHI_SERIES: dict[str, list[str]] = {
+    "SPY": ["KXINXW", "KXINXM", "KXINX"],                    # S&P 500 weekly/monthly/daily
+    "QQQ": ["KXNASDAQ100W", "KXNASDAQ100M", "KXNASDAQ100"],  # Nasdaq-100
+    "IBIT": ["KXBTCW", "KXBTCD"],                            # BTC 5pm EDT benchmark
+}
+
+# Claim level -> contract underlying mapping (same-day raw closes, yfinance).
+KALSHI_UNDERLYING: dict[str, str] = {
+    "SPY": "^GSPC",
+    "QQQ": "^NDX",
+    "IBIT": "BTC-USD",
+}
+
+# A contract must settle within this many trading sessions of the claim's
+# resolves_on to count. Sparse coverage is expected and accepted: with Kalshi's
+# current listings (settles through Friday), roughly Mon/Tue anchors match.
+KALSHI_MAX_SETTLE_GAP_SESSIONS = 2
+
+# Widest acceptable yes bid/ask spread (in dollars) for a usable mid-quote.
+KALSHI_MAX_SPREAD = 0.10
+
+# Polite gap between unauthenticated API calls (the public limit trips easily).
+KALSHI_THROTTLE_S = 1.0
+
 # --- Market / calendar -------------------------------------------------------
 # NYSE calendar covers SPY/QQQ/IWM (US equity ETFs).
 EXCHANGE = "XNYS"
@@ -96,16 +184,46 @@ MARKET_TZ = "America/New_York"
 # The label stored on each row so Pythia and every baseline can be graded
 # side by side on the same claims.
 PYTHIA = "pythia"
-BASELINES: list[str] = ["coin_flip", "drift", "naive_momentum"]
-ALL_FORECASTERS: list[str] = [PYTHIA, *BASELINES]
+HMM_FILTER = "hmm_filter"
+KALSHI = "kalshi"
+BASELINES: list[str] = ["coin_flip", "drift", "naive_momentum", HMM_FILTER, KALSHI]
+
+# The Delphi-validated correction stack (Delphi summary.md §8: lessons and
+# isotonic calibration each help, and STACK), run as separate arms on identical
+# claims so every layer stays measured, never assumed:
+#   pythia             raw Opus — the permanent control arm
+#   pythia_coached     Opus + distilled lessons in the prompt (reflect.py)
+#   pythia_iso         isotonic remap of pythia's raw probability (calibrate.py)
+#   pythia_coached_iso isotonic remap of the coached probability (full stack)
+PYTHIA_COACHED = "pythia_coached"
+PYTHIA_ISO = "pythia_iso"
+PYTHIA_COACHED_ISO = "pythia_coached_iso"
+PYTHIA_ARMS: list[str] = [PYTHIA, PYTHIA_COACHED, PYTHIA_ISO, PYTHIA_COACHED_ISO]
+ALL_FORECASTERS: list[str] = [*PYTHIA_ARMS, *BASELINES]
 
 # Human-friendly labels for review output.
 FORECASTER_LABELS: dict[str, str] = {
-    "pythia": "Pythia",
+    "pythia": "Pythia (raw)",
+    "pythia_coached": "Pythia + lessons",
+    "pythia_iso": "Pythia + isotonic",
+    "pythia_coached_iso": "Pythia + lessons + isotonic",
     "coin_flip": "Coin flip",
     "drift": "Drift (base rate)",
     "naive_momentum": "Naive momentum",
+    "hmm_filter": "HMM filter (quant bar)",
+    "kalshi": "Kalshi (market odds)",
 }
+
+# --- Self-review (reflect.py) --------------------------------------------------
+# Don't review until the record can support generalizable lessons.
+REFLECT_MIN_RESOLVED = 25
+REFLECT_MAX_LESSONS = 8
+
+# --- Isotonic calibration (calibrate.py) ----------------------------------------
+# Below this many resolved rows the remap overfits noise (measured in Delphi:
+# isotonic HURT at ~200-400 training points, shone at ~1,700) — the derived
+# columns simply skip until the record is big enough.
+ISO_MIN_RESOLVED = 150
 
 # --- Storage -----------------------------------------------------------------
 # The track record lives in a local SQLite file (gitignored). Override with
@@ -119,6 +237,11 @@ def db_path() -> Path:
     if override:
         return Path(override)
     return _PROJECT_ROOT / "pythia.db"
+
+
+# Live lessons file (written by `pythia reflect`, read by the coached arm).
+# Gitignore-adjacent state like the DB; history sits next to it.
+LESSONS_PATH = _PROJECT_ROOT / "lessons.txt"
 
 
 # --- Email alerts (optional; roadmap v3, pulled forward) ---------------------

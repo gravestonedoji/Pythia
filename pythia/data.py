@@ -87,6 +87,18 @@ def trading_days_forward(start: date, n: int) -> date:
         window *= 2  # holiday-dense stretch; widen and retry
 
 
+def sessions_between(start: date, end: date) -> int:
+    """Signed count of trading sessions in (start, end] — 0 when equal,
+    negative when `end` is before `start`. Neither endpoint needs to be a
+    session itself (e.g. a weekend crypto-contract settle date).
+    """
+    if start == end:
+        return 0
+    a, b = (start, end) if start < end else (end, start)
+    n = len(_calendar.valid_days(start_date=a + timedelta(days=1), end_date=b))
+    return n if start < end else -n
+
+
 # --- Price data (network via yfinance) ---------------------------------------
 
 def _import_yf():

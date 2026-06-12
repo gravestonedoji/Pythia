@@ -133,8 +133,14 @@ def forecast(
     resolves_on: date,
     client=None,
     model: str | None = None,
+    lessons: str | None = None,
 ) -> ForecastResult:
-    """Produce a calibrated forecast for `claim` from price history alone."""
+    """Produce a calibrated forecast for `claim` from price history alone.
+
+    ``lessons`` (the coached arm) appends the distilled self-review lessons to
+    the system prompt — this is the only difference between the ``pythia`` and
+    ``pythia_coached`` arms, so the coaching effect is cleanly measurable.
+    """
     model = model or config.MODEL_FORECAST
     if client is None:
         import anthropic
@@ -151,10 +157,17 @@ def forecast(
         price_context=data.format_price_context(history),
     )
 
+    system = build_system_prompt(config.asset_class(ticker))
+    if lessons:
+        system += (
+            "\n\nLESSONS FROM YOUR OWN GRADED RECORD — apply them to this "
+            f"forecast:\n{lessons}"
+        )
+
     response = client.messages.create(
         model=model,
         max_tokens=1024,
-        system=build_system_prompt(config.asset_class(ticker)),
+        system=system,
         tools=[_TOOL],
         tool_choice={"type": "tool", "name": "submit_forecast"},
         messages=[{"role": "user", "content": user_prompt}],

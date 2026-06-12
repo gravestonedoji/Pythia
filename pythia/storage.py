@@ -45,6 +45,9 @@ class Forecast:
     resolved_close: float | None = None
     resolved_at: str | None = None
     brier: float | None = None  # (probability - outcome)^2; None until resolved
+    # Fit-health flags, hmm_filter rows only (hmm_health.py): comma-joined flag
+    # names, '' = fit checked and clean, NULL = predates health monitoring.
+    fit_flags: str | None = None
 
 
 _SCHEMA = """
@@ -66,10 +69,34 @@ CREATE TABLE IF NOT EXISTS forecasts (
     resolved_close REAL,
     resolved_at   TEXT,
     brier         REAL,
+    fit_flags     TEXT,
     UNIQUE (forecaster, ticker, anchor_date, horizon_days)
 );
 CREATE INDEX IF NOT EXISTS idx_forecasts_status ON forecasts (status);
 CREATE INDEX IF NOT EXISTS idx_forecasts_resolves_on ON forecasts (resolves_on);
+
+-- HMM fit-health telemetry (hmm_health.py): one row per (ticker, anchor) fit —
+-- convergence, parameters, data window, and any stability flags vs the
+-- previous fit. The referee's own audit trail; never used to drop a forecast.
+CREATE TABLE IF NOT EXISTS hmm_fits (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker        TEXT    NOT NULL,
+    anchor_date   TEXT    NOT NULL,
+    fitted_at     TEXT    NOT NULL,
+    converged     INTEGER NOT NULL,
+    n_iter        INTEGER NOT NULL,
+    loglik        REAL    NOT NULL,
+    n_states      INTEGER NOT NULL,
+    n_obs         INTEGER NOT NULL,
+    window_start  TEXT    NOT NULL,
+    window_end    TEXT    NOT NULL,
+    params        TEXT    NOT NULL,          -- JSON {mu, sig, transition, pi}
+    flags         TEXT    NOT NULL DEFAULT '',
+    compared_to   TEXT,
+    detail        TEXT,
+    UNIQUE (ticker, anchor_date)
+);
+CREATE INDEX IF NOT EXISTS idx_hmm_fits_ticker ON hmm_fits (ticker, anchor_date);
 """
 
 
@@ -84,8 +111,13 @@ def get_connection(path: str | Path | None = None) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """Create the schema if it does not already exist."""
+    """Create the schema if it does not already exist, migrating older DBs."""
     conn.executescript(_SCHEMA)
+    # fit_flags arrived 2026-06-12; databases created before then have the
+    # forecasts table (so CREATE IF NOT EXISTS skips it) but lack the column.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(forecasts)")}
+    if "fit_flags" not in cols:
+        conn.execute("ALTER TABLE forecasts ADD COLUMN fit_flags TEXT")
     conn.commit()
 
 
@@ -97,13 +129,13 @@ def insert_forecast(conn: sqlite3.Connection, fc: Forecast) -> int | None:
         INSERT OR IGNORE INTO forecasts (
             issued_at, forecaster, ticker, claim, horizon_days,
             anchor_date, anchor_close, resolves_on, probability,
-            reasoning, model, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            reasoning, model, status, fit_flags
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             fc.issued_at, fc.forecaster, fc.ticker, fc.claim, fc.horizon_days,
             fc.anchor_date, fc.anchor_close, fc.resolves_on, fc.probability,
-            fc.reasoning, fc.model, fc.status,
+            fc.reasoning, fc.model, fc.status, fc.fit_flags,
         ),
     )
     conn.commit()
@@ -158,5 +190,68 @@ def fetch_all(conn: sqlite3.Connection, status: str | None = None) -> list[sqlit
             "SELECT * FROM forecasts WHERE status = ? "
             "ORDER BY issued_at DESC, ticker, forecaster",
             (status,),
+        )
+    return cur.fetchall()
+
+
+def set_fit_flags(conn: sqlite3.Connection, forecast_id: int, flags: str) -> None:
+    """Mark a forecast row with its fit's health flags ('' = checked, clean)."""
+    conn.execute("UPDATE forecasts SET fit_flags = ? WHERE id = ?",
+                 (flags, forecast_id))
+    conn.commit()
+
+
+# --- HMM fit-health telemetry (hmm_health.py) ----------------------------------
+
+def insert_hmm_fit(conn: sqlite3.Connection, rec) -> int | None:
+    """Persist a checked hmm_health.FitRecord. First write wins per
+    (ticker, anchor_date) — like forecasts, re-runs are idempotent no-ops."""
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO hmm_fits (
+            ticker, anchor_date, fitted_at, converged, n_iter, loglik,
+            n_states, n_obs, window_start, window_end, params, flags,
+            compared_to, detail
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            rec.ticker, rec.anchor_date, rec.fitted_at, int(rec.converged),
+            rec.n_iter, rec.loglik, rec.n_states, rec.n_obs,
+            rec.window_start, rec.window_end, rec.params_json(),
+            ",".join(rec.flags), rec.compared_to, rec.detail,
+        ),
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        return None  # duplicate, ignored
+    return cur.lastrowid
+
+
+def latest_hmm_fit_before(
+    conn: sqlite3.Connection, ticker: str, anchor_date: str
+) -> sqlite3.Row | None:
+    """The most recent fit STRICTLY before `anchor_date` — the only previous
+    fit a point-in-time stability check is allowed to see."""
+    cur = conn.execute(
+        """
+        SELECT * FROM hmm_fits WHERE ticker = ? AND anchor_date < ?
+        ORDER BY anchor_date DESC LIMIT 1
+        """,
+        (ticker, anchor_date),
+    )
+    return cur.fetchone()
+
+
+def fetch_hmm_fits(
+    conn: sqlite3.Connection, ticker: str | None = None
+) -> list[sqlite3.Row]:
+    """All fit-health rows (optionally one ticker), newest anchor first."""
+    if ticker is None:
+        cur = conn.execute(
+            "SELECT * FROM hmm_fits ORDER BY anchor_date DESC, ticker")
+    else:
+        cur = conn.execute(
+            "SELECT * FROM hmm_fits WHERE ticker = ? ORDER BY anchor_date DESC",
+            (ticker,),
         )
     return cur.fetchall()

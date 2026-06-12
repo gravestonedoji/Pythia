@@ -1,7 +1,8 @@
 # CLAUDE.md — Pythia
 
 Read this every session. It is the contract for what Pythia is and the rules it
-must not break.
+must not break. For the current project state, the experiment ladder, and the
+Delphi findings that shaped it, read `summary.md` (the canonical handoff).
 
 ## What Pythia is
 
@@ -51,11 +52,24 @@ built so each added data layer can be *measured* against the simpler one.
 - **Raw (unadjusted) closes.** Anchor close and resolved close are both raw
   closes from the same source, so a logged claim resolves to the same answer no
   matter when it is graded (adjusted closes get rewritten on dividends).
-- **The baseline ladder.** Every run scores three trivial forecasters on the
+- **The baseline ladder.** Every run scores the reference forecasters on the
   *same* claims as Pythia: `coin_flip` (0.50, the floor), `drift` (the asset's
-  historical positive-day ratio — the real bar), and `naive_momentum` (direction
-  of the last N sessions). The question is not "did Pythia win?" but "*what* did
-  it beat?"
+  historical positive-day ratio), `naive_momentum` (direction of the last N
+  sessions), and `hmm_filter` — a Gaussian HMM regime filter fitted per ticker,
+  strictly point-in-time (only closes <= the anchor date ever reach the fit).
+  The HMM is the **quant bar**: the strongest free, price-only statistical
+  forecaster. The question is not "did Pythia win?" but "*what* did it beat?" —
+  and the deploy-grade question is specifically "does it beat the quant bar?".
+  `pythia backfill-hmm` reconstructs it onto pre-existing claims point-in-time.
+- **The market bar (`kalshi`, kalshi.py).** Fifth column on mapped tickers only
+  (SPY/QQQ/IBIT → S&P 500 / Nasdaq-100 / BTC contracts): the live Kalshi
+  order-book mid, read at forecast time, escalating the gate to "beat the
+  market". Read-only public data — no account, no orders, firmly on the
+  forecast/grade side of the hard wall. **Never feed odds into the forecaster
+  prompt** (Delphi's anchoring experiment showed the LLM parrots the crowd and
+  subtracts value). Sparse by design: a claim only gets a row when a whitelisted
+  contract settles within 2 trading sessions of `resolves_on` (the gap is
+  recorded in the row's reasoning); no backfill, live books only.
 
 ## Tech stack
 
@@ -73,11 +87,12 @@ built so each added data layer can be *measured* against the simpler one.
 ## Run commands
 
 ```
-uv run pythia forecast    # form + log one forecast per watchlist ticker (Pythia + baselines)
+uv run pythia forecast    # form + log one forecast per watchlist ticker (all arms + baselines)
 uv run pythia resolve     # settle matured forecasts against the real close and score them
+uv run pythia reflect     # weekly self-review -> lessons.txt (turns the coached arm on)
 uv run pythia review      # print the track record, side by side with the baselines
 uv run pythia notify      # email a forecast batch (re-send the latest, or --test SMTP)
-uv run pytest             # run the scoring + calendar tests
+uv run pytest             # run the offline test suite (no network, no key)
 ```
 
 `forecast` needs `ANTHROPIC_API_KEY` (copy `.env.example` to `.env`). `resolve`,
@@ -102,9 +117,10 @@ tests/           scoring + calendar + notify tests (offline, no network/key)
 
 ## Roadmap (build v0 first; don't jump ahead)
 
-- **v1** — LLM self-review (Opus reads the record, proposes a better prompt;
-  run two strategies head-to-head) + FRED macro as a *measured* experiment vs the
-  v0 price-only baseline.
+- **v1** — LLM self-review: DONE (`pythia reflect` + the `pythia_coached` /
+  isotonic arms — see summary.md §4; the Delphi-validated correction stack,
+  every layer measured against the raw arm on identical claims). Still to do:
+  FRED macro as a *measured* experiment vs the v0 price-only baseline.
 - **v2** — simulated liquid ETF option positions, marked to market (still
   simulated only).
 - **v3** — daily digest + alerting (email/Telegram/Discord), flagging only
