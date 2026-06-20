@@ -23,6 +23,7 @@ Honesty rules (same spirit as the rest of Pythia):
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from datetime import date
 
@@ -60,9 +61,15 @@ def _emissions(r: np.ndarray, mu: np.ndarray, sig: np.ndarray) -> np.ndarray:
     return np.maximum(e, 1e-300)
 
 
-def fit_hmm(returns: np.ndarray, K: int, *, iters: int = 40,
+def fit_hmm(returns: np.ndarray, K: int, *, iters: int = config.HMM_EM_MAX_ITERS,
             restarts: int = 2, seed: int = 0) -> HMMFit:
-    """Baum-Welch EM for a Gaussian-emission HMM (scaled forward-backward)."""
+    """Baum-Welch EM for a Gaussian-emission HMM (scaled forward-backward).
+
+    ``iters`` is a cap, not a budget — the loop breaks at the loglik tolerance
+    (the watchlist needs ~30-110 iterations; see config.HMM_EM_MAX_ITERS).
+    The cap was 40 until 2026-06-12, which truncated 97% of recorded fits just
+    short of tolerance; reconstruction of those rows pins the old cap via the
+    `em` model-descriptor token (em_cap_from_model)."""
     r = np.asarray(returns, float)
     n = len(r)
     if n < 10 * K:
@@ -153,9 +160,13 @@ def prob_up_over_horizon(fit: HMMFit, belief: np.ndarray, horizon: int,
     return float((total >= 0.0).mean())
 
 
-def hmm_probability_up(log_returns: np.ndarray, horizon: int, *, seed: int = 0
+def hmm_probability_up(log_returns: np.ndarray, horizon: int, *, seed: int = 0,
+                       em_iters: int = config.HMM_EM_MAX_ITERS,
                        ) -> tuple[float, HMMFit, np.ndarray]:
-    """Fit + filter + simulate: the full pure pipeline from returns to P(up)."""
+    """Fit + filter + simulate: the full pure pipeline from returns to P(up).
+
+    ``em_iters`` exists for method-faithful reconstruction of rows logged under
+    an older cap (hmm-health --backfill); live forecasts use the default."""
     n = len(log_returns)
     if n < config.HMM_MIN_SESSIONS:
         raise RuntimeError(
@@ -163,7 +174,7 @@ def hmm_probability_up(log_returns: np.ndarray, horizon: int, *, seed: int = 0
             f"to fit the HMM honestly"
         )
     k = config.HMM_STATES if n >= config.HMM_RICH_HISTORY_SESSIONS else 2
-    fit = fit_hmm(log_returns, K=k, seed=seed)
+    fit = fit_hmm(log_returns, K=k, iters=em_iters, seed=seed)
     belief = filter_belief(log_returns, fit)
     p = prob_up_over_horizon(fit, belief, horizon,
                              n_paths=config.HMM_MC_PATHS, seed=seed + 1)
@@ -179,8 +190,18 @@ def _seed_for(ticker: str, anchor_date: date) -> int:
     return int(h[:8], 16)
 
 
+def em_cap_from_model(model: str | None) -> int:
+    """The EM iteration cap a logged row was fitted under, from its model
+    descriptor's `em` token. Rows logged before the cap was raised
+    (2026-06-12) carry no token and reconstruct under the legacy cap — the
+    method that produced them, not today's."""
+    m = re.search(r",em(\d+)\)", model or "")
+    return int(m.group(1)) if m else config.HMM_EM_LEGACY_ITERS
+
+
 def hmm_prediction_with_health(
-    ticker: str, history: pd.DataFrame, anchor_date: date, horizon: int
+    ticker: str, history: pd.DataFrame, anchor_date: date, horizon: int,
+    *, em_iters: int = config.HMM_EM_MAX_ITERS,
 ) -> tuple[BaselinePrediction, FitRecord]:
     """Build the HMM forecast from pre-fetched history, sliced to the anchor.
 
@@ -196,7 +217,8 @@ def hmm_prediction_with_health(
     closes = past["Close"].dropna()
     log_returns = np.diff(np.log(closes.values))
     seed = _seed_for(ticker, anchor_date)
-    p, fit, belief = hmm_probability_up(log_returns, horizon, seed=seed)
+    p, fit, belief = hmm_probability_up(log_returns, horizon, seed=seed,
+                                        em_iters=em_iters)
 
     order = np.argsort(fit.mu)  # lowest-drift state first, for readability
     desc = ", ".join(
@@ -207,7 +229,8 @@ def hmm_prediction_with_health(
     prediction = BaselinePrediction(
         forecaster=config.HMM_FILTER,
         probability=p,
-        model=f"baseline:hmm(K={fit.K},{fit.n_obs}d,mc{config.HMM_MC_PATHS // 1000}k)",
+        model=(f"baseline:hmm(K={fit.K},{fit.n_obs}d,"
+               f"mc{config.HMM_MC_PATHS // 1000}k,em{em_iters})"),
         reasoning=(
             f"Gaussian HMM fitted on {fit.n_obs} sessions of {ticker} daily "
             f"log-returns up to {anchor_date.isoformat()} ({desc}). "

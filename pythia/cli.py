@@ -381,9 +381,11 @@ def _backfill_hmm_health(conn) -> None:
     """Retro-annotate hmm_filter rows that predate health monitoring.
 
     Fits are deterministic — seeded from (ticker, anchor) over raw closes, on
-    the same window (trimmed to the n_obs recorded in the row's model field) —
-    so refitting point-in-time reproduces the fit behind each logged value up
-    to source-data drift (HMM_RECONSTRUCTION_TOL). A reconstruction that lands
+    the same window (trimmed to the n_obs recorded in the row's model field)
+    and under the same EM cap (the row's `em` descriptor token; rows from
+    before the cap was raised pin the legacy 40) — so refitting point-in-time
+    reproduces the fit behind each logged value up to source-data drift
+    (HMM_RECONSTRUCTION_TOL). A reconstruction that lands
     further from the logged probability than that is flagged
     reconstruction_mismatch rather than trusted. Nothing is dropped or altered
     beyond the health mark.
@@ -432,8 +434,12 @@ def _backfill_hmm_health(conn) -> None:
                 closes_idx = [d for d in hist["Close"].dropna().index
                               if d.date() <= anchor]
                 hist = hist.loc[closes_idx[-(int(m.group(1)) + 1):]]
+            # ... and under the SAME EM cap: rows logged before the cap was
+            # raised (2026-06-12) reconstruct with the legacy 40, or a
+            # converged refit would read as a false reconstruction_mismatch.
             hb, fit_rec = hmm_baseline.hmm_prediction_with_health(
-                tk, hist, anchor, r["horizon_days"])
+                tk, hist, anchor, r["horizon_days"],
+                em_iters=hmm_baseline.em_cap_from_model(r["model"]))
             prev_row = storage.latest_hmm_fit_before(conn, tk, r["anchor_date"])
             hmm_health.health_check(
                 fit_rec, hmm_health.record_from_row(prev_row) if prev_row else None)

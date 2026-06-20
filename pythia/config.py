@@ -119,6 +119,18 @@ HMM_RICH_HISTORY_SESSIONS = 750   # below this many sessions, drop to 2 states
 HMM_MIN_SESSIONS = 300            # below this, refuse to fit (young funds e.g. ETHA)
 HMM_MC_PATHS = 20_000             # Monte-Carlo paths for the horizon probability
 
+# EM iteration cap for the Baum-Welch fit. A CAP, not a budget: the loop breaks
+# at its loglik tolerance, which the watchlist needs ~30-110 iterations to meet
+# (audited 2026-06-12, audit_em_convergence.py) — so a converging fit never
+# pays for the headroom, and a fit that still hits this cap is genuinely stuck
+# and gets the non_converged taint. History: 40 until 2026-06-12, which
+# truncated 97% of fits a hair short of tolerance (same failure mode Delphi
+# found and fixed the same day, summary.md §18 there). Rows logged under the
+# old cap carry no `em` token in their model descriptor and are reconstructed
+# with HMM_EM_LEGACY_ITERS so retro health checks stay method-faithful.
+HMM_EM_MAX_ITERS = 1000
+HMM_EM_LEGACY_ITERS = 40          # the cap behind every row logged without an em token
+
 # --- HMM fit-health monitoring (hmm_health.py) ---------------------------------
 # The quant bar is the deploy gate, so a silently broken referee corrupts every
 # leaderboard comparison against it. Every fit is recorded and judged: EM that

@@ -14,9 +14,11 @@ import pytest
 
 from pythia import config
 from pythia.hmm_baseline import (
+    em_cap_from_model,
     fit_hmm,
     filter_belief,
     hmm_prediction_from_history,
+    hmm_prediction_with_health,
     hmm_probability_up,
     prob_up_over_horizon,
 )
@@ -108,3 +110,49 @@ def test_probability_never_certain():
     r = rng.normal(0.005, 0.0005, 1000)
     p, _, _ = hmm_probability_up(r, horizon=5, seed=2)
     assert p <= 0.99
+
+
+# --- EM cap: recorded on every row, pinned for reconstruction --------------------
+# The cap was 40 until 2026-06-12 (it truncated 97% of fits just short of
+# tolerance). Rows carry the cap they were fitted under in their model
+# descriptor's `em` token; rows from before the token exist reconstruct under
+# the legacy cap — the method that produced them, not today's.
+
+def _history(n: int = 1300, seed: int = 9) -> tuple[pd.DataFrame, date]:
+    r = _two_regime_returns(n, seed=seed)
+    idx = pd.bdate_range("2020-01-01", periods=n + 1)
+    closes = 100 * np.exp(np.concatenate([[0.0], np.cumsum(r)]))
+    return pd.DataFrame({"Close": closes}, index=idx), idx[-1].date()
+
+
+def test_em_cap_descriptor_round_trips_and_legacy_rows_pin_old_cap():
+    history, anchor = _history()
+    pred, _ = hmm_prediction_with_health("TEST", history, anchor, horizon=5)
+    assert f",em{config.HMM_EM_MAX_ITERS})" in pred.model
+    assert em_cap_from_model(pred.model) == config.HMM_EM_MAX_ITERS
+    # pre-token descriptors (every row logged before 2026-06-12) -> legacy cap
+    assert em_cap_from_model("baseline:hmm(K=3,2512d,mc20k)") == config.HMM_EM_LEGACY_ITERS
+    assert em_cap_from_model(None) == config.HMM_EM_LEGACY_ITERS
+
+
+def test_em_iters_reaches_the_fit():
+    history, anchor = _history()
+    pred, rec = hmm_prediction_with_health("TEST", history, anchor, horizon=5,
+                                           em_iters=2)
+    assert rec.converged is False
+    assert rec.n_iter == 2
+    assert ",em2)" in pred.model
+
+
+def test_legacy_reconstruction_reproduces_the_truncated_fit():
+    # A row logged under the old cap must reconstruct under the old cap; a
+    # refit at today's cap can land in a different (converged) optimum and
+    # would read as a false reconstruction_mismatch.
+    history, anchor = _history()
+    logged, _ = hmm_prediction_with_health(
+        "TEST", history, anchor, horizon=5, em_iters=config.HMM_EM_LEGACY_ITERS)
+    legacy_model = "baseline:hmm(K=2,1299d,mc20k)"  # pre-token format
+    rebuilt, _ = hmm_prediction_with_health(
+        "TEST", history, anchor, horizon=5,
+        em_iters=em_cap_from_model(legacy_model))
+    assert rebuilt.probability == logged.probability

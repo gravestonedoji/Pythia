@@ -200,4 +200,44 @@ NOT touch what the HMM emits.
   converges". Whether to give EM more iterations / restarts (and re-baseline)
   is a METHODOLOGY decision deliberately not taken by the build session: it
   changes what the bar is, so it needs an explicit owner call, ideally
-  Delphi-tested first.
+  Delphi-tested first. *(Both conditions met the same day — see §10.)*
+
+## 10. COMPLETED 2026-06-12 — EM runs to convergence (the §9 owner call, Delphi-tested)
+
+The §9 methodology question got its answer the hard way: Delphi found the
+SAME bug in its own quant the same day — a too-small EM cap silently
+truncating fits mid-climb — and fixing it there moved its quant bar from ~56%
+to ~87% signal capture (Delphi summary.md §17–18). Audited Pythia's bar on
+the live data and seeds BEFORE changing anything (`audit_em_convergence.py`,
+numbers in `audit_em_convergence.json`):
+
+- **28/30 watchlist fits truncated at iters=40** (§9's 97% reproduced on
+  fresh fits) — but the case is MILD here: every ticker meets tolerance by
+  108 iterations (median 72), the loglik left on the table is median 0.7 /
+  max 22 (SLV), and the bar VALUE barely moves: |dP(up)| median 0.001, max
+  0.028 (SOXX), 0/30 at or above 0.05. Unlike Delphi's 27 capture points,
+  the truncation never seriously distorted this leaderboard — but a referee
+  should meet its own tolerance, and §9's ~1e-4 reconstruction drift was a
+  symptom of exactly this (an unsettled fit amplifies Yahoo's quiet close
+  revisions). Converging costs median 1.6s → 2.8s per fit (~+35s/day).
+- **The change** (`config.py`): `HMM_EM_MAX_ITERS = 1000` — a CAP, not a
+  budget; the loop breaks at tolerance (~30–110 iters on the watchlist), so
+  a converging fit never pays the headroom, and a fit that still hits the
+  cap is genuinely stuck and keeps its `non_converged` taint. Determinism
+  unchanged (same (ticker, anchor) seeds, same restarts).
+- **Method-faithful reconstruction**: every hmm row's model descriptor now
+  records the cap it was fitted under (`baseline:hmm(K=3,2512d,mc20k,em1000)`)
+  and `hmm-health --backfill` refits each row under the row's OWN cap
+  (`em_cap_from_model`; no token = pre-changeover row = `HMM_EM_LEGACY_ITERS`
+  40). Without the pin, a retro health check of an old row would converge
+  into a different optimum and read as a false `reconstruction_mismatch`.
+- **Nothing logged was rewritten** (the wall stands): all resolved quant-bar
+  values and their flags stay exactly as logged. CHANGEOVER NOTE for future
+  pooled reads: hmm_filter rows are pre/post distinguishable PER ROW by the
+  `em` token (and per fit by `hmm_fits.converged`/`n_iter`). The value shift
+  across the boundary is ≤0.028, so pooled Brier ladders are fine; just
+  don't read pre/post stability flags as one regime, and expect the
+  `non_converged` taint rate to drop to ~0 from here on.
+- Tests 110 → 113 (em-token round-trip + legacy default; em_iters provably
+  reaches the fit; legacy reconstruction reproduces the truncated fit
+  exactly).
