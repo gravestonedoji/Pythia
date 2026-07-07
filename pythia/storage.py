@@ -442,9 +442,15 @@ def latest_anchor_for(
 def insert_option_quote(
     conn: sqlite3.Connection, ticker: str, anchor_date: str, horizon_days: int,
     q: dict, *, usable: bool, reject_reason: str | None, gates: str,
+    commit: bool = True,
 ) -> int | None:
     """Log one side of the entry book (usable or refused — both are the audit
-    trail). First write wins per (ticker, anchor_date, horizon, side)."""
+    trail). First write wins per (ticker, anchor_date, horizon, side).
+
+    Pass ``commit=False`` for the first side of a pair so both sides land in
+    ONE transaction — a crash between two separate commits would leave a
+    half-logged book.
+    """
     cur = conn.execute(
         """
         INSERT OR IGNORE INTO option_quotes (
@@ -460,7 +466,8 @@ def insert_option_quote(
             q["last_trade_at"], int(usable), reject_reason, gates,
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     if cur.rowcount == 0:
         return None  # duplicate, ignored
     return cur.lastrowid
@@ -555,9 +562,21 @@ def insert_publish(
     return cur.lastrowid
 
 
-def latest_publish(conn: sqlite3.Connection) -> sqlite3.Row | None:
-    """The most recent publish record, for change detection."""
-    cur = conn.execute("SELECT * FROM publishes ORDER BY id DESC LIMIT 1")
+def latest_publish(
+    conn: sqlite3.Connection, out_path: str | None = None
+) -> sqlite3.Row | None:
+    """The most recent publish record, for change detection.
+
+    Scoped to one output directory when given — publishing to docs/ must not
+    be skipped just because the same content already went to some other
+    --out target."""
+    if out_path is None:
+        cur = conn.execute("SELECT * FROM publishes ORDER BY id DESC LIMIT 1")
+    else:
+        cur = conn.execute(
+            "SELECT * FROM publishes WHERE out_path = ? ORDER BY id DESC LIMIT 1",
+            (out_path,),
+        )
     return cur.fetchone()
 
 

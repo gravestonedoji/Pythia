@@ -282,6 +282,10 @@ def _row_to_quote(df, strike: float, side: str, expiry: date,
     oi = _clean(col("openInterest"))
     vol = _clean(col("volume"))
     ltd = col("lastTradeDate")
+    # A never-traded contract carries pd.NaT, which HAS isoformat() (returning
+    # the literal string 'NaT'); like NaN it is not equal to itself.
+    if ltd is not None and ltd != ltd:
+        ltd = None
     return {
         "side": side,
         "expiry_date": expiry.isoformat(),
@@ -396,6 +400,7 @@ def settle_due(
     today: date | None = None,
     close_fetcher: CloseFetcher | None = None,
     is_open: OpenChecker | None = None,
+    last_completed: date | None = None,
 ) -> list[SettleResult]:
     """Settle every expired, still-open paper position at intrinsic value.
 
@@ -404,14 +409,22 @@ def settle_due(
     whose close is not yet available stay open and retry on the next run. A
     recorded expiry that turns out not to be a trading session is reported and
     left open — guessing a different settle date would be a fudged mark.
+
+    A settled row is permanent, so a session that has not CLOSED yet is never
+    settleable: during market hours Yahoo serves the in-progress bar as
+    today's "close", and an intraday run would freeze a live price into the
+    record. The cutoff is clamped to the last completed session — a position
+    expiring today settles on the first run after the bell. `last_completed`
+    is injectable for offline tests.
     """
     from . import storage  # local import: storage has no reason to import paper
 
     today = today or date.today()
     close_fetcher = close_fetcher or data.close_on
     is_open = is_open or data.is_market_open
+    last_completed = last_completed or data.latest_completed_session()
 
-    due = storage.fetch_open_positions_due(conn, today)
+    due = storage.fetch_open_positions_due(conn, min(today, last_completed))
     results: list[SettleResult] = []
     close_cache: dict[tuple[str, date], float] = {}
 

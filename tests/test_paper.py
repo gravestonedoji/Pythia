@@ -13,6 +13,9 @@ import pytest
 from pythia import cli, config, paper, storage
 from pythia.paper import PaperPosition
 
+# Inside the entry window for the 2026-07-10 (Friday) anchor used below.
+_NOW = datetime(2026, 7, 10, 21, 0, tzinfo=timezone.utc)
+
 
 def quote(side="C", bid=1.00, ask=1.10, oi=5000, strike=620.0,
           expiry="2026-07-17", last=1.05, volume=250,
@@ -264,7 +267,7 @@ def test_settle_call_and_put_at_intrinsic(conn):
     storage.insert_paper_position(conn, _position(fc="pythia", side="C"))
     storage.insert_paper_position(conn, _position(fc="drift", side="P", mid=0.95))
     results = paper.settle_due(
-        conn, today=date(2026, 7, 17),
+        conn, today=date(2026, 7, 17), last_completed=date(2026, 7, 17),
         close_fetcher=lambda t, d: 625.0, is_open=lambda d: True)
     assert {r.status for r in results} == {"settled"}
     rows = {r["forecaster"]: r for r in storage.fetch_paper_positions(conn)}
@@ -285,6 +288,7 @@ def test_settle_waits_for_unavailable_close(conn):
         raise RuntimeError("no close yet")
 
     results = paper.settle_due(conn, today=date(2026, 7, 17),
+                               last_completed=date(2026, 7, 17),
                                close_fetcher=no_data, is_open=lambda d: True)
     assert results[0].status == "skipped"
     assert storage.fetch_paper_positions(conn)[0]["status"] == "open"  # retries
@@ -293,6 +297,7 @@ def test_settle_waits_for_unavailable_close(conn):
 def test_settle_skips_non_session_expiry_without_guessing(conn):
     storage.insert_paper_position(conn, _position())
     results = paper.settle_due(conn, today=date(2026, 7, 17),
+                               last_completed=date(2026, 7, 17),
                                close_fetcher=lambda t, d: 625.0,
                                is_open=lambda d: False)
     assert results[0].status == "skipped"
@@ -303,9 +308,23 @@ def test_settle_skips_non_session_expiry_without_guessing(conn):
 def test_settle_ignores_unexpired_positions(conn):
     storage.insert_paper_position(conn, _position())
     results = paper.settle_due(conn, today=date(2026, 7, 16),
+                               last_completed=date(2026, 7, 16),
                                close_fetcher=lambda t, d: 625.0,
                                is_open=lambda d: True)
     assert results == []
+
+
+def test_settle_never_uses_an_uncompleted_session(conn):
+    # Expiry day has arrived but the session hasn't CLOSED: an intraday run
+    # must not settle against the in-progress bar (Yahoo serves the live
+    # price as today's "close"; a settled row is permanent).
+    storage.insert_paper_position(conn, _position())
+    results = paper.settle_due(conn, today=date(2026, 7, 17),
+                               last_completed=date(2026, 7, 16),
+                               close_fetcher=lambda t, d: 625.0,
+                               is_open=lambda d: True)
+    assert results == []
+    assert storage.fetch_paper_positions(conn)[0]["status"] == "open"
 
 
 # --- the cli pass: symmetry + logged-rows-only + idempotency -----------------------------
@@ -325,7 +344,7 @@ def test_paper_pass_symmetric_refusal_logs_quotes_but_no_positions(conn, monkeyp
     # would let bullish arms trade while bearish arms skip).
     monkeypatch.setattr(paper, "fetch_chain_pair",
                         lambda *a, **k: (quote("C"), quote("P", bid=0.0), 0))
-    cli._paper_pass(conn, "SPY", "2026-07-10", 5)
+    cli._paper_pass(conn, "SPY", "2026-07-10", 5, now=_NOW)
     pair = storage.fetch_quote_pair(conn, "SPY", "2026-07-10", 5)
     assert pair["C"]["usable"] == 1 and pair["P"]["usable"] == 0
     assert "bid" in pair["P"]["reject_reason"]
@@ -342,7 +361,7 @@ def test_paper_pass_opens_positions_from_logged_rows_and_is_idempotent(conn, mon
         return quote("C"), quote("P", bid=0.90, ask=1.00), 0
 
     monkeypatch.setattr(paper, "fetch_chain_pair", fake_fetch)
-    cli._paper_pass(conn, "SPY", "2026-07-10", 5)
+    cli._paper_pass(conn, "SPY", "2026-07-10", 5, now=_NOW)
     rows = storage.fetch_paper_positions(conn)
     assert {r["forecaster"] for r in rows} == {"pythia", "drift"}  # 0.5 sits out
     by_fc = {r["forecaster"]: r for r in rows}
@@ -350,7 +369,7 @@ def test_paper_pass_opens_positions_from_logged_rows_and_is_idempotent(conn, mon
     assert by_fc["pythia"]["probability"] == 0.62  # the LOGGED p, audit-copied
 
     # Second run: the logged book is reused (no refetch), positions unchanged.
-    cli._paper_pass(conn, "SPY", "2026-07-10", 5)
+    cli._paper_pass(conn, "SPY", "2026-07-10", 5, now=_NOW)
     assert calls[0] == 1
     assert len(storage.fetch_paper_positions(conn)) == 2
 
@@ -366,10 +385,43 @@ def test_paper_pass_unusable_logged_book_never_refetches(conn, monkeypatch):
         raise AssertionError("must not refetch a logged book (first write wins)")
 
     monkeypatch.setattr(paper, "fetch_chain_pair", boom)
-    cli._paper_pass(conn, "SPY", "2026-07-10", 5)
+    cli._paper_pass(conn, "SPY", "2026-07-10", 5, now=_NOW)
     assert storage.fetch_paper_positions(conn) == []
 
 
 def test_paper_pass_requires_logged_claim_rows(conn):
     with pytest.raises(RuntimeError, match="no logged forecast rows"):
-        cli._paper_pass(conn, "SPY", "2026-07-10", 5)
+        cli._paper_pass(conn, "SPY", "2026-07-10", 5, now=_NOW)
+
+
+def test_paper_pass_refuses_positions_after_the_entry_window(conn, monkeypatch):
+    # A usable pair is already LOGGED, but the next session has opened: the
+    # position inserts must refuse too — a late run that has glimpsed (or
+    # knows) the outcome could otherwise choose which claims to "enter".
+    _log_claim(conn, {"pythia": 0.62})
+    storage.insert_option_quote(conn, "SPY", "2026-07-10", 5, quote("C"),
+                                usable=True, reject_reason=None, gates="")
+    storage.insert_option_quote(conn, "SPY", "2026-07-10", 5,
+                                quote("P", bid=0.90, ask=1.00),
+                                usable=True, reject_reason=None, gates="")
+    late = datetime(2026, 7, 13, 15, 0, tzinfo=timezone.utc)  # Mon, post-open
+    with pytest.raises(RuntimeError, match="post-anchor"):
+        cli._paper_pass(conn, "SPY", "2026-07-10", 5, now=late)
+    assert storage.fetch_paper_positions(conn) == []
+
+
+def test_paper_pass_recovers_a_half_logged_pair(conn, monkeypatch):
+    # Legacy hazard: a crash between the two quote inserts (they are atomic
+    # now) left one side logged. While the window is open, the pass refetches
+    # and fills ONLY the missing side (first write wins on the logged one).
+    _log_claim(conn, {"pythia": 0.62})
+    storage.insert_option_quote(conn, "SPY", "2026-07-10", 5, quote("C"),
+                                usable=True, reject_reason=None, gates="")
+    monkeypatch.setattr(paper, "fetch_chain_pair",
+                        lambda *a, **k: (quote("C", bid=9.0, ask=9.1),
+                                         quote("P", bid=0.90, ask=1.00), 0))
+    cli._paper_pass(conn, "SPY", "2026-07-10", 5, now=_NOW)
+    pair = storage.fetch_quote_pair(conn, "SPY", "2026-07-10", 5)
+    assert pair["C"]["bid"] == 1.00  # the originally logged side stayed
+    assert pair["P"]["bid"] == 0.90  # the missing side got filled
+    assert len(storage.fetch_paper_positions(conn)) == 1

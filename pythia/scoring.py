@@ -75,6 +75,7 @@ def resolve_due(
     today: date | None = None,
     close_fetcher: CloseFetcher | None = None,
     is_open: OpenChecker | None = None,
+    last_completed: date | None = None,
 ) -> list[ResolveResult]:
     """Resolve every matured, still-pending forecast.
 
@@ -83,13 +84,21 @@ def resolve_due(
     and persist the result. Forecasts whose price data is not yet available
     (e.g. resolving the same day before data posts) are left pending to retry.
 
-    `close_fetcher` and `is_open` are injectable for testing without network.
+    A resolved row is permanent, so a session that has not CLOSED yet is never
+    resolvable: during market hours Yahoo serves the in-progress bar as
+    today's "close", and an intraday run would grade against a live price.
+    The cutoff is clamped to the last completed session — a claim resolving
+    today grades on the first run after the bell.
+
+    `close_fetcher`, `is_open`, and `last_completed` are injectable for
+    testing without network.
     """
     today = today or date.today()
     close_fetcher = close_fetcher or data.close_on
     is_open = is_open or data.is_market_open
+    last_completed = last_completed or data.latest_completed_session()
 
-    due = storage.fetch_pending_due(conn, today)
+    due = storage.fetch_pending_due(conn, min(today, last_completed))
     results: list[ResolveResult] = []
     # All forecasters share a (ticker, resolves_on) close, so fetch each once.
     close_cache: dict[tuple[str, date], float] = {}

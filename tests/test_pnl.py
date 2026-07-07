@@ -165,7 +165,11 @@ def test_ladder_groups_by_forecaster_and_policy():
 
 
 def test_ladder_min_edge_slices_at_read_time():
+    # min_edge is |p - 0.5| (as documented), NOT the 2|p-0.5| stake
+    # multiplier: p=0.60 has |p-0.5| = 0.10 and must be excluded at 0.15
+    # (under the doubled scale it would sneak in at 0.20).
     rows = [pos(fc="pythia", p=0.55, intrinsic=2.0),
+            pos(fc="pythia", p=0.60, intrinsic=2.0),
             pos(fc="pythia", p=0.70, intrinsic=0.0)]
     books = pnl.ladder(rows, min_edge=0.15)
     b = books[("pythia", "fixed")]

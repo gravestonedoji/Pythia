@@ -175,7 +175,9 @@ def ladder(rows, *, policies: tuple[str, ...] | None = None,
     policies = policies or config.PAPER_POLICIES
     by_fc: dict[str, list] = defaultdict(list)
     for r in rows:
-        if _edge(r["probability"]) < min_edge:
+        # The slice is |p - 0.5| >= min_edge (as documented and printed by
+        # `pythia pnl`) — NOT the 2|p-0.5| stake multiplier.
+        if abs(r["probability"] - 0.5) < min_edge:
             continue
         by_fc[r["forecaster"]].append(r)
     out: dict[tuple[str, str], BookStats] = {}

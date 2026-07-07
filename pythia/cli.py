@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import re
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import List, Optional
 
 # Make output robust on legacy Windows consoles: model reasoning (and our own
@@ -80,7 +80,8 @@ def _macro_snapshot_for(
     return snap
 
 
-def _paper_pass(conn, ticker: str, anchor_date_iso: str, horizon: int) -> None:
+def _paper_pass(conn, ticker: str, anchor_date_iso: str, horizon: int,
+                *, now: datetime | None = None) -> None:
     """Capture the entry book and open SIMULATED positions for one claim (v2).
 
     Probabilities come from the LOGGED forecast rows read back from the DB —
@@ -90,22 +91,39 @@ def _paper_pass(conn, ticker: str, anchor_date_iso: str, horizon: int) -> None:
     already logged, only the missing position inserts are retried (the logged
     book is the book, usable or not). Raises on claim-level refusals with
     nothing to log (kalshi precedent: the missing row is the record).
+
+    The entry window gates POSITIONS, not just quote capture: a logged usable
+    pair must not be turned into positions after the next session opens — a
+    late run that already glimpsed (or knows) the outcome could otherwise
+    choose which claims to "enter". `now` is injectable for offline tests.
     """
+    now = now or datetime.now(timezone.utc)
     claim_rows = storage.fetch_claim_rows(conn, ticker, anchor_date_iso, horizon)
     if not claim_rows:
         raise RuntimeError("no logged forecast rows for the claim")
     anchor_close = claim_rows[0]["anchor_close"]
     resolves_on = date.fromisoformat(claim_rows[0]["resolves_on"])
 
+    ok, why = paper.entry_window_ok(date.fromisoformat(anchor_date_iso), now)
+    if not ok:
+        raise RuntimeError(why)
+
     pair = storage.fetch_quote_pair(conn, ticker, anchor_date_iso, horizon)
-    if not pair:
+    if len(pair) < 2:
+        # No book yet — or a half-logged one (a crash between inserts before
+        # they became atomic): fetch and fill; INSERT OR IGNORE keeps any
+        # already-logged side, so first-write-wins holds per side.
         call_q, put_q, gap = paper.fetch_chain_pair(
-            ticker, date.fromisoformat(anchor_date_iso), anchor_close, resolves_on)
+            ticker, date.fromisoformat(anchor_date_iso), anchor_close, resolves_on,
+            now=now)
         ok_c, why_c = paper.usable_quote(call_q)
         ok_p, why_p = paper.usable_quote(put_q)
         gates = config.option_gates_descriptor()
+        # One transaction for the pair: a half-logged book must not be able
+        # to persist.
         storage.insert_option_quote(conn, ticker, anchor_date_iso, horizon, call_q,
-                                    usable=ok_c, reject_reason=why_c or None, gates=gates)
+                                    usable=ok_c, reject_reason=why_c or None,
+                                    gates=gates, commit=False)
         storage.insert_option_quote(conn, ticker, anchor_date_iso, horizon, put_q,
                                     usable=ok_p, reject_reason=why_p or None, gates=gates)
         pair = storage.fetch_quote_pair(conn, ticker, anchor_date_iso, horizon)
@@ -240,23 +258,29 @@ def forecast(
             )]
             # Coached arm: same claim, same data, lessons appended to the system
             # prompt — the ONLY difference, so coaching stays measurable.
+            # Best-effort like the hmm/kalshi columns: an API error on a
+            # derived arm must not discard the raw forecast already computed
+            # for this ticker (rows insert only after all arms are gathered).
             arm_probs = {config.PYTHIA: pres.probability}
             if lessons:
-                cres = forecaster.forecast(
-                    tk, history,
-                    claim=claim, horizon_days=horizon,
-                    anchor_date=anchor_date, anchor_close=anchor_close,
-                    resolves_on=resolves_on, client=client,
-                    lessons=lessons[0],
-                )
-                arm_probs[config.PYTHIA_COACHED] = cres.probability
-                rows.append(Forecast(
-                    forecaster=config.PYTHIA_COACHED, ticker=tk, claim=claim,
-                    horizon_days=horizon, anchor_date=anchor_date.isoformat(),
-                    anchor_close=anchor_close, resolves_on=resolves_on.isoformat(),
-                    probability=cres.probability, reasoning=cres.reasoning,
-                    model=f"{cres.model}+lessons:{lessons[1]}",
-                ))
+                try:
+                    cres = forecaster.forecast(
+                        tk, history,
+                        claim=claim, horizon_days=horizon,
+                        anchor_date=anchor_date, anchor_close=anchor_close,
+                        resolves_on=resolves_on, client=client,
+                        lessons=lessons[0],
+                    )
+                    arm_probs[config.PYTHIA_COACHED] = cres.probability
+                    rows.append(Forecast(
+                        forecaster=config.PYTHIA_COACHED, ticker=tk, claim=claim,
+                        horizon_days=horizon, anchor_date=anchor_date.isoformat(),
+                        anchor_close=anchor_close, resolves_on=resolves_on.isoformat(),
+                        probability=cres.probability, reasoning=cres.reasoning,
+                        model=f"{cres.model}+lessons:{lessons[1]}",
+                    ))
+                except Exception as exc:  # noqa: BLE001 - coached arm is best-effort
+                    console.print(f"  [yellow]pythia_coached skipped: {exc}[/yellow]")
             # Macro arm (v1): same claim, same price data, plus a point-in-time
             # FRED macro block in the prompt and the macro system prompt that
             # lifts the price-only restriction. The ONLY difference from raw
@@ -264,22 +288,25 @@ def forecast(
             # macro sha is recorded in `model` so any record slice ties to the
             # exact macro data the arm saw.
             if macro_enabled:
-                snap = _macro_snapshot_for(anchor_date.isoformat(), macro_cache, conn)
-                if snap is not None:
-                    mres = forecaster.forecast(
-                        tk, history,
-                        claim=claim, horizon_days=horizon,
-                        anchor_date=anchor_date, anchor_close=anchor_close,
-                        resolves_on=resolves_on, client=client,
-                        macro_context=macro.format_macro_context(snap),
-                    )
-                    rows.append(Forecast(
-                        forecaster=config.PYTHIA_MACRO, ticker=tk, claim=claim,
-                        horizon_days=horizon, anchor_date=anchor_date.isoformat(),
-                        anchor_close=anchor_close, resolves_on=resolves_on.isoformat(),
-                        probability=mres.probability, reasoning=mres.reasoning,
-                        model=f"{mres.model}+macro:{snap.context_sha}",
-                    ))
+                try:
+                    snap = _macro_snapshot_for(anchor_date.isoformat(), macro_cache, conn)
+                    if snap is not None:
+                        mres = forecaster.forecast(
+                            tk, history,
+                            claim=claim, horizon_days=horizon,
+                            anchor_date=anchor_date, anchor_close=anchor_close,
+                            resolves_on=resolves_on, client=client,
+                            macro_context=macro.format_macro_context(snap),
+                        )
+                        rows.append(Forecast(
+                            forecaster=config.PYTHIA_MACRO, ticker=tk, claim=claim,
+                            horizon_days=horizon, anchor_date=anchor_date.isoformat(),
+                            anchor_close=anchor_close, resolves_on=resolves_on.isoformat(),
+                            probability=mres.probability, reasoning=mres.reasoning,
+                            model=f"{mres.model}+macro:{snap.context_sha}",
+                        ))
+                except Exception as exc:  # noqa: BLE001 - macro arm is best-effort
+                    console.print(f"  [yellow]pythia_macro skipped: {exc}[/yellow]")
             # Derived isotonic arms: free (no model call), strictly point-in-time
             # remaps of the base arms' probabilities. Skipped until the base
             # arm's resolved record clears ISO_MIN_RESOLVED.
@@ -449,8 +476,12 @@ def forecast(
             )
             if sent:
                 console.print(f"[green]Emailed {len(notifications)} prediction(s).[/green]")
-                for aid in alert_ids:
-                    storage.mark_alert_emailed(conn, aid)
+                # Delivery is only a fact if the digest actually rode the
+                # email — a failed digest pass (digest_text None) means the
+                # alerts were never shown to the human.
+                if digest_text is not None:
+                    for aid in alert_ids:
+                        storage.mark_alert_emailed(conn, aid)
             else:
                 console.print(
                     "[dim]Email not configured — set PYTHIA_SMTP_USER and "
@@ -1234,11 +1265,12 @@ def publish(
         return
 
     out_dir = Path(out) if out else config.DASH_OUT_DIR
-    last = storage.latest_publish(conn)
-    # Skip only when the unchanged output actually exists at the target —
+    last = storage.latest_publish(conn, str(out_dir))
+    # Skip only when the unchanged output actually exists at THIS target —
     # otherwise a deleted docs/ or a fresh --out directory would never fill.
     if (last is not None and last["content_sha"] == data_obj.content_sha
-            and (out_dir / "index.html").exists() and not force):
+            and (out_dir / "index.html").exists()
+            and (out_dir / "data.json").exists() and not force):
         console.print(
             f"[dim]Dashboard unchanged since {last['published_at'][:10]} "
             f"(content {data_obj.content_sha}) — nothing written.[/dim]")
