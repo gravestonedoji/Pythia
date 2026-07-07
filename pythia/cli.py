@@ -30,8 +30,8 @@ from rich.console import Console
 from rich.table import Table
 
 from . import (
-    baselines, calibrate, config, data, digest, forecaster, hmm_baseline,
-    hmm_health, kalshi, macro, paper, reflect, scoring, storage,
+    baselines, calibrate, config, dashboard, data, digest, forecaster,
+    hmm_baseline, hmm_health, kalshi, macro, paper, reflect, scoring, storage,
 )
 from . import notify as notifier  # aliased: the `notify` command below would shadow it
 from . import pnl as paper_pnl    # aliased: the `pnl` command below would shadow it
@@ -1164,6 +1164,75 @@ def notify(
         digest=digest_text, n_flagged=n_flagged,
     )
     console.print(f"[green]Emailed {len(preds)} prediction(s) from {target}.[/green]")
+
+
+# --- publish -----------------------------------------------------------------
+
+@app.command()
+def publish(
+    out: Optional[str] = typer.Option(
+        None, "--out", help="Output directory (default: docs/)."),
+    force: bool = typer.Option(
+        False, "--force", help="Write even when the record is unchanged."),
+    stdout: bool = typer.Option(
+        False, "--stdout", help="Print the HTML instead of writing files."),
+) -> None:
+    """Build the dashboard (docs/index.html + data.json) from the local DB.
+
+    AGGREGATES ONLY — no claim text, reasoning, or per-claim probabilities;
+    pending claims appear as counts, never as calls. This command writes local
+    files and NEVER touches git: whether the record goes public (GitHub Pages
+    needs a public repo on the free tier) is an owner decision. Unchanged
+    records (same content sha as the last publish) skip the write.
+    """
+    from pathlib import Path
+
+    conn = storage.get_connection()
+    rows = storage.fetch_all(conn)
+    if not rows:
+        console.print("[dim]No forecasts logged yet — nothing to publish.[/dim]")
+        raise typer.Exit(code=1)
+
+    taint = hmm_health.taint_summary(rows)
+    paper_rows = storage.fetch_paper_positions(conn)
+    alert_stats = digest.alert_scoreboard(storage.fetch_digest_alerts(conn), rows)
+    data_obj = dashboard.build_dashboard_data(
+        rows, taint, today=date.today(), generated_at=storage.now_iso(),
+        paper_rows=paper_rows, alert_stats=alert_stats,
+    )
+
+    if stdout:
+        # print() not console.print(): the HTML must reach a pipe unstyled.
+        print(dashboard.render_html(data_obj))
+        return
+
+    last = storage.latest_publish(conn)
+    if last is not None and last["content_sha"] == data_obj.content_sha and not force:
+        console.print(
+            f"[dim]Dashboard unchanged since {last['published_at'][:10]} "
+            f"(content {data_obj.content_sha}) — nothing written.[/dim]")
+        return
+
+    out_dir = Path(out) if out else config.DASH_OUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "index.html").write_text(
+        dashboard.render_html(data_obj), encoding="utf-8")
+    (out_dir / "data.json").write_text(
+        dashboard.render_json(data_obj), encoding="utf-8")
+    nojekyll = out_dir / ".nojekyll"  # Pages must serve docs/ verbatim
+    if not nojekyll.exists():
+        nojekyll.write_text("")
+    storage.insert_publish(
+        conn, content_sha=data_obj.content_sha, n_rows=data_obj.n_rows,
+        n_resolved=data_obj.n_resolved, out_path=str(out_dir),
+        generator=config.DASH_GENERATOR,
+    )
+    console.print(
+        f"[green]Dashboard written[/green] -> {out_dir / 'index.html'}\n"
+        f"[dim]{data_obj.n_claims_resolved} claims resolved, "
+        f"{len(data_obj.curves)} calibration panels, content "
+        f"{data_obj.content_sha}. Aggregates only; publishing the docs/ folder "
+        f"anywhere is a separate, human decision.[/dim]")
 
 
 # --- alerts ------------------------------------------------------------------

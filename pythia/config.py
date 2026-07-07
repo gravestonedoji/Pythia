@@ -415,6 +415,21 @@ def db_path() -> Path:
 LESSONS_PATH = _PROJECT_ROOT / "lessons.txt"
 
 
+# --- Public dashboard (dashboard.py; roadmap v4) --------------------------------
+# `pythia publish` renders AGGREGATES ONLY (no claim text, reasoning, or
+# per-claim probabilities — the DB stays local and gitignored) to docs/, which
+# GitHub Pages can serve if and when the owner decides the record goes public
+# (free-tier Pages requires a public repo — an owner call, not a default).
+# The command never touches git.
+DASH_OUT_DIR = _PROJECT_ROOT / "docs"
+DASH_CAL_MIN_RESOLVED = 100   # below this an arm shows no calibration curve at all
+DASH_CAL_MIN_BIN = 25         # minimum resolved claims per calibration bin
+DASH_CAL_MAX_BINS = 8         # cap on quantile bins even for the biggest arm
+DASH_RANK_EMBARGO_DAYS = 90   # "do not rank yet" banner until the record is this old
+DASH_TITLE = "Pythia — a self-grading forecasting experiment"
+DASH_GENERATOR = "dashboard:v1"  # stamped into publishes.generator; bump on layout breaks
+
+
 # --- Email alerts (optional; roadmap v3, pulled forward) ---------------------
 # Surfacing-only: Pythia can email a summary of each batch of predictions right
 # after it logs them, so a human can see what was called and in which direction.

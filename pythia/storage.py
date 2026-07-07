@@ -198,6 +198,20 @@ CREATE TABLE IF NOT EXISTS digest_alerts (
     emailed_at    TEXT,
     UNIQUE (ticker, anchor_date, horizon_days)
 );
+
+-- Publish audit trail (dashboard.py): one row per `pythia publish` that wrote
+-- output. content_sha hashes the aggregate payload EXCLUDING the generated-at
+-- stamp, so an unchanged record hashes identically day to day and publish can
+-- skip the no-op write. Append-only; never read for grading.
+CREATE TABLE IF NOT EXISTS publishes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    published_at  TEXT    NOT NULL,
+    content_sha   TEXT    NOT NULL,
+    n_rows        INTEGER NOT NULL,
+    n_resolved    INTEGER NOT NULL,
+    out_path      TEXT    NOT NULL,
+    generator     TEXT    NOT NULL
+);
 """
 
 
@@ -520,6 +534,31 @@ def mark_position_settled(
         (settle_close, intrinsic, pnl_per_unit, settled_at or now_iso(), position_id),
     )
     conn.commit()
+
+
+# --- Publish audit trail (dashboard.py) -----------------------------------------
+
+def insert_publish(
+    conn: sqlite3.Connection, *, content_sha: str, n_rows: int,
+    n_resolved: int, out_path: str, generator: str,
+) -> int:
+    """Record one dashboard publish (append-only audit trail)."""
+    cur = conn.execute(
+        """
+        INSERT INTO publishes
+            (published_at, content_sha, n_rows, n_resolved, out_path, generator)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (now_iso(), content_sha, n_rows, n_resolved, out_path, generator),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def latest_publish(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """The most recent publish record, for change detection."""
+    cur = conn.execute("SELECT * FROM publishes ORDER BY id DESC LIMIT 1")
+    return cur.fetchone()
 
 
 # --- High-conviction alert log (digest.py) --------------------------------------
