@@ -151,6 +151,24 @@ def test_same_inputs_render_byte_identical_html():
     assert dashboard.render_html(_build(rows)) == dashboard.render_html(_build(rows))
 
 
+def test_content_sha_stable_across_calendar_days_during_embargo():
+    # The embargo banner embeds the record's age in days; the sha must not —
+    # or every day of the 90-day embargo would defeat the unchanged-skip.
+    rows = _record(120)
+    taint = hmm_health.taint_summary(rows)
+    a = dashboard.build_dashboard_data(rows, taint, today=date(2026, 4, 1),
+                                       generated_at=FROZEN)
+    b = dashboard.build_dashboard_data(rows, taint, today=date(2026, 4, 2),
+                                       generated_at=FROZEN)
+    assert a.embargo is not None  # embargo active on both days
+    assert a.content_sha == b.content_sha
+
+
+def test_html_declares_utf8_charset():
+    html = dashboard.render_html(_build(_record(30)))
+    assert html.startswith('<meta charset="utf-8">')
+
+
 def test_content_sha_excludes_timestamp_but_sees_new_rows():
     rows = _record(120)
     taint = hmm_health.taint_summary(rows)
@@ -243,6 +261,13 @@ def test_publish_writes_once_and_skips_unchanged(cli_env, tmp_path):
     r3 = runner.invoke(app, ["publish", "--out", str(out), "--force"])
     assert r3.exit_code == 0
     assert storage.latest_publish(conn)["id"] != first_id
+
+    # Unchanged sha but a FRESH target directory must still write — the skip
+    # is about no-op rewrites, not about refusing to fill a missing output.
+    fresh = tmp_path / "site-b"
+    r4 = runner.invoke(app, ["publish", "--out", str(fresh)])
+    assert r4.exit_code == 0
+    assert (fresh / "index.html").exists()
     conn.close()
 
 

@@ -424,6 +424,22 @@ def forecast(
     except Exception as exc:  # noqa: BLE001 - alerting must not break a logged run
         console.print(f"[yellow]digest pass failed: {exc}[/yellow]")
 
+    # If this run was all duplicates (e.g. a retry after last night's SMTP
+    # failure) there are no fresh notifications — but unmailed flagged alerts
+    # mean the batch email never reached a human. Rebuild it from the LOGGED
+    # rows so the retry actually retries.
+    if notify and not notifications and alert_ids:
+        notifications = [
+            notifier.Prediction(
+                ticker=r["ticker"], probability=r["probability"],
+                anchor_date=r["anchor_date"], anchor_close=r["anchor_close"],
+                resolves_on=r["resolves_on"], reasoning=r["reasoning"] or "",
+            )
+            for key in batch_keys
+            for r in storage.fetch_claim_rows(conn, *key)
+            if r["forecaster"] == config.PYTHIA
+        ]
+
     # Email is best-effort: a logged run must never fail because alerting did.
     if notify and notifications:
         try:
@@ -1136,6 +1152,7 @@ def notify(
     # alert rows are ever written from this path — no backfill.
     digest_text = None
     n_flagged = 0
+    logged: list = []
     try:
         all_rows = storage.fetch_all(conn)
         alerts_all = storage.fetch_digest_alerts(conn)
@@ -1147,7 +1164,11 @@ def notify(
         logged = [a for a in alerts_all
                   if (a["ticker"], a["anchor_date"], a["horizon_days"]) in batch_keys]
         if logged:
-            flagged = digest.flagged_from_alert_rows(logged, batch_claim_rows)
+            # The full alert table is the repeat_of scan pool — an earlier
+            # batch's overlapping alert must still render its correlation
+            # caveat on a re-send.
+            flagged = digest.flagged_from_alert_rows(
+                logged, batch_claim_rows, prior_alert_rows=alerts_all)
             reconstructed = False
         else:
             flagged = digest.build_flagged_calls(batch_claim_rows, alerts_all)
@@ -1159,10 +1180,16 @@ def notify(
     except Exception as exc:  # noqa: BLE001 - the batch email still goes out
         console.print(f"[yellow]digest rebuild failed: {exc}[/yellow]")
 
-    notifier.notify_predictions(
+    sent = notifier.notify_predictions(
         preds, issued_on=target, horizon_days=batch[0]["horizon_days"],
         digest=digest_text, n_flagged=n_flagged,
     )
+    if sent:
+        # The human was actually notified of these logged alerts — record the
+        # delivery (first delivery time wins; mark_alert_emailed only fills
+        # NULLs). Reconstructed flags have no rows, so nothing is backfilled.
+        for a in logged:
+            storage.mark_alert_emailed(conn, a["id"])
     console.print(f"[green]Emailed {len(preds)} prediction(s) from {target}.[/green]")
 
 
@@ -1206,14 +1233,17 @@ def publish(
         print(dashboard.render_html(data_obj))
         return
 
+    out_dir = Path(out) if out else config.DASH_OUT_DIR
     last = storage.latest_publish(conn)
-    if last is not None and last["content_sha"] == data_obj.content_sha and not force:
+    # Skip only when the unchanged output actually exists at the target —
+    # otherwise a deleted docs/ or a fresh --out directory would never fill.
+    if (last is not None and last["content_sha"] == data_obj.content_sha
+            and (out_dir / "index.html").exists() and not force):
         console.print(
             f"[dim]Dashboard unchanged since {last['published_at'][:10]} "
             f"(content {data_obj.content_sha}) — nothing written.[/dim]")
         return
 
-    out_dir = Path(out) if out else config.DASH_OUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "index.html").write_text(
         dashboard.render_html(data_obj), encoding="utf-8")
@@ -1273,7 +1303,7 @@ def alerts(
             outcomes[(r["ticker"], r["anchor_date"], r["horizon_days"])] = r["outcome"]
 
     table = Table(title=f"Alert log (showing up to {limit}, newest first)", box=box.ASCII)
-    table.add_column("created", no_wrap=True)
+    table.add_column("anchor", no_wrap=True)
     table.add_column("ticker", no_wrap=True)
     table.add_column("dir", no_wrap=True)
     table.add_column("P", justify="right", no_wrap=True)

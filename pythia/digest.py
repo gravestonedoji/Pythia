@@ -131,13 +131,18 @@ def build_flagged_calls(
     return out
 
 
-def flagged_from_alert_rows(alert_rows, forecast_rows) -> list[FlaggedCall]:
+def flagged_from_alert_rows(alert_rows, forecast_rows,
+                            prior_alert_rows=None) -> list[FlaggedCall]:
     """Rebuild FlaggedCalls VERBATIM from logged digest_alerts rows (re-sends).
 
     Direction, probability, and flagged_by come from the alert row exactly as
     logged — never recomputed under today's config. Forecast rows supply only
-    display context (arm probs, reasoning, anchor close).
+    display context (arm probs, reasoning, anchor close). `prior_alert_rows`
+    is the repeat_of scan pool (pass the FULL alert table — an overlapping
+    alert from an earlier batch must still render its correlation caveat);
+    defaults to `alert_rows` itself.
     """
+    pool = alert_rows if prior_alert_rows is None else prior_alert_rows
     by_key: dict[tuple[str, str, str, int], dict] = {}
     for r in forecast_rows:
         by_key[(r["forecaster"], r["ticker"], r["anchor_date"],
@@ -155,12 +160,19 @@ def flagged_from_alert_rows(alert_rows, forecast_rows) -> list[FlaggedCall]:
             if row is not None:
                 arm_probs[arm] = row["probability"]
                 anchor_close = row["anchor_close"]
-        lead_row = by_key.get((flagged_by[0], a["ticker"], a["anchor_date"],
+        # The reasoning must belong to the arm whose p the alert row stored
+        # (the most extreme one at issue) — flagged_by is in gate-arm order,
+        # so match by the stored probability, falling back to the first arm.
+        lead = next((arm for arm in flagged_by
+                     if arm in arm_probs
+                     and abs(arm_probs[arm] - a["probability"]) < 1e-9),
+                    flagged_by[0])
+        lead_row = by_key.get((lead, a["ticker"], a["anchor_date"],
                                a["horizon_days"]))
         if lead_row is not None:
             reasoning = lead_row["reasoning"] or ""
         repeat_of = None
-        for other in alert_rows:
+        for other in pool:
             if (other["ticker"] == a["ticker"]
                     and other["anchor_date"] < a["anchor_date"]
                     and other["resolves_on"] >= a["anchor_date"]
@@ -273,9 +285,15 @@ def format_digest_sections(
         others = ", ".join(
             f"{a} {c.arm_probs[a] * 100:.0f}%" for a in c.arm_probs
             if a not in c.flagged_by)
+        # Each flagged arm renders with its OWN probability: two arms can
+        # cross the line in OPPOSITE directions, and a bare name list would
+        # read as co-signers of the headline direction.
+        flagged_bits = ", ".join(
+            f"{a} {c.arm_probs[a] * 100:.0f}%" if a in c.arm_probs else a
+            for a in c.flagged_by)
         lines.append(
             f"{c.direction:<4} {c.ticker:<5} P(up) {c.probability * 100:5.1f}%  "
-            f"[{', '.join(c.flagged_by)}]" + (f"  (others: {others})" if others else ""))
+            f"[{flagged_bits}]" + (f"  (others: {others})" if others else ""))
         lines.append(
             f"     anchor {c.anchor_close:.2f} ({c.anchor_date}) -> "
             f"resolves {c.resolves_on}")

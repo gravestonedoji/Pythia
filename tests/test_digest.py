@@ -159,6 +159,45 @@ def test_digest_reconstructed_label():
     assert "reconstructed" in text and "not logged" in text
 
 
+def test_flagged_from_alert_rows_repeat_of_uses_the_full_pool():
+    # A re-send renders only the batch's own alerts, but the correlation
+    # caveat must still see overlapping alerts from EARLIER batches.
+    batch_alert = arow(ticker="USO", anchor="2026-07-03", resolves="2026-07-10",
+                       direction="UP", p=0.70, flagged_by="pythia")
+    earlier = arow(ticker="USO", anchor="2026-07-01", resolves="2026-07-08")
+    rows = [frow("pythia", 0.70, ticker="USO", anchor="2026-07-03")]
+    calls = digest.flagged_from_alert_rows(
+        [batch_alert], rows, prior_alert_rows=[batch_alert, earlier])
+    assert calls[0].repeat_of == "2026-07-01"
+    # Without the pool (default), the batch alone can't see the earlier alert.
+    assert digest.flagged_from_alert_rows([batch_alert], rows)[0].repeat_of is None
+
+
+def test_flagged_from_alert_rows_reasoning_follows_the_stored_probability():
+    # flagged_by is in gate-arm order; the stored p belongs to the MOST
+    # extreme arm (coached here) — the reasoning must come from that arm,
+    # not from flagged_by[0].
+    alert = arow(ticker="SPY", anchor="2026-06-23", resolves="2026-06-30",
+                 direction="DOWN", p=0.30, flagged_by="pythia,pythia_coached")
+    forecasts = [
+        frow("pythia", 0.66, ticker="SPY", anchor="2026-06-23",
+             reasoning="raw arm reasoning"),
+        frow("pythia_coached", 0.30, ticker="SPY", anchor="2026-06-23",
+             reasoning="coached arm reasoning"),
+    ]
+    calls = digest.flagged_from_alert_rows([alert], forecasts)
+    assert calls[0].reasoning == "coached arm reasoning"
+
+
+def test_digest_shows_each_flagged_arm_with_its_own_probability():
+    # Two arms can cross the line in OPPOSITE directions — the flag line must
+    # not render them as co-signers of the headline direction.
+    rows = [frow("pythia", 0.66), frow("pythia_coached", 0.30)]
+    calls = digest.build_flagged_calls(rows, [])
+    text = digest.format_digest_sections(calls, digest.AlertStats(), {})
+    assert "pythia 66%" in text and "pythia_coached 30%" in text
+
+
 def test_flagged_from_alert_rows_is_verbatim_not_recomputed():
     # The stored alert says DOWN at 0.30 by pythia; today's forecast row for
     # that claim shows 0.55 (as if the arm were re-run) — the render must keep

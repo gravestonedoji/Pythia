@@ -336,7 +336,10 @@ def _payload(data: DashboardData) -> dict:
         "accum_series": data.accum_series,
         "taint_lines": data.taint_lines,
         "kalshi_note": data.kalshi_note,
-        "embargo": data.embargo,
+        # Boolean, not the text: the banner embeds the record's age in days,
+        # which would change the sha every calendar day and defeat the
+        # unchanged-skip during the entire embargo window.
+        "embargo_active": data.embargo is not None,
         "paper_lines": data.paper_lines,
         "alert_lines": data.alert_lines,
     }
@@ -479,6 +482,10 @@ def render_html(data: DashboardData) -> str:
     """The whole page as one self-contained HTML string (deterministic for a
     given DashboardData — the determinism tests depend on it)."""
     h: list[str] = []
+    # Without an explicit charset, file:// and some servers default to
+    # windows-1252 and the page's em-dashes/≥ render as mojibake.
+    h.append('<meta charset="utf-8">')
+    h.append('<meta name="viewport" content="width=device-width, initial-scale=1">')
     h.append(f"<title>{escape(config.DASH_TITLE)}</title>")
     h.append(f"<style>{_CSS}</style>")
     h.append(f'<div class="strip">{escape(_DISCLAIMER)}</div>')
