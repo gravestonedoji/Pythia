@@ -1,0 +1,1 @@
+- When price closes at or very near the window low after a sharp multi-day decline, treat continuation as no more likely than reversion and keep P within 5 points of 0.50.
