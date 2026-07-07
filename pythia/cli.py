@@ -31,9 +31,10 @@ from rich.table import Table
 
 from . import (
     baselines, calibrate, config, data, forecaster, hmm_baseline, hmm_health,
-    kalshi, macro, reflect, scoring, storage,
+    kalshi, macro, paper, reflect, scoring, storage,
 )
 from . import notify as notifier  # aliased: the `notify` command below would shadow it
+from . import pnl as paper_pnl    # aliased: the `pnl` command below would shadow it
 from .storage import Forecast
 
 app = typer.Typer(
@@ -79,6 +80,60 @@ def _macro_snapshot_for(
     return snap
 
 
+def _paper_pass(conn, ticker: str, anchor_date_iso: str, horizon: int) -> None:
+    """Capture the entry book and open SIMULATED positions for one claim (v2).
+
+    Probabilities come from the LOGGED forecast rows read back from the DB —
+    never from in-memory results — so a partial-run retry can never open a
+    position whose p matches no row in the record. First-write-wins on both
+    quotes and positions makes the whole pass idempotent; if the book was
+    already logged, only the missing position inserts are retried (the logged
+    book is the book, usable or not). Raises on claim-level refusals with
+    nothing to log (kalshi precedent: the missing row is the record).
+    """
+    claim_rows = storage.fetch_claim_rows(conn, ticker, anchor_date_iso, horizon)
+    if not claim_rows:
+        raise RuntimeError("no logged forecast rows for the claim")
+    anchor_close = claim_rows[0]["anchor_close"]
+    resolves_on = date.fromisoformat(claim_rows[0]["resolves_on"])
+
+    pair = storage.fetch_quote_pair(conn, ticker, anchor_date_iso, horizon)
+    if not pair:
+        call_q, put_q, gap = paper.fetch_chain_pair(
+            ticker, date.fromisoformat(anchor_date_iso), anchor_close, resolves_on)
+        ok_c, why_c = paper.usable_quote(call_q)
+        ok_p, why_p = paper.usable_quote(put_q)
+        gates = config.option_gates_descriptor()
+        storage.insert_option_quote(conn, ticker, anchor_date_iso, horizon, call_q,
+                                    usable=ok_c, reject_reason=why_c or None, gates=gates)
+        storage.insert_option_quote(conn, ticker, anchor_date_iso, horizon, put_q,
+                                    usable=ok_p, reject_reason=why_p or None, gates=gates)
+        pair = storage.fetch_quote_pair(conn, ticker, anchor_date_iso, horizon)
+
+    # BOTH sides must be usable or nobody trades (symmetric refusal — a
+    # one-sided book would let bullish arms trade while bearish arms skip).
+    if len(pair) < 2 or not (pair["C"]["usable"] and pair["P"]["usable"]):
+        why = "; ".join(pair[s]["reject_reason"] for s in sorted(pair)
+                        if not pair[s]["usable"] and pair[s]["reject_reason"])
+        console.print(f"  [yellow]paper: book refused ({why or 'incomplete pair'}) "
+                      "— quotes logged, no positions[/yellow]")
+        return
+
+    call_q, put_q = dict(pair["C"]), dict(pair["P"])
+    gap = data.sessions_between(resolves_on, date.fromisoformat(call_q["expiry_date"]))
+    opened = present = 0
+    for pos in paper.positions_for_claim(claim_rows, call_q, put_q, gap):
+        if storage.insert_paper_position(conn, pos) is not None:
+            opened += 1
+        else:
+            present += 1
+    note = f", {present} already present" if present else ""
+    console.print(
+        f"  [green]paper: {opened} simulated position(s) opened{note}[/green] "
+        f"[dim]{call_q['expiry_date']} {call_q['strike']:.2f} pair, "
+        f"expiry gap {gap:+d}s[/dim]")
+
+
 def _fmt_pct(x: Optional[float]) -> str:
     return f"{x * 100:.1f}%" if x is not None else "-"
 
@@ -100,6 +155,11 @@ def forecast(
     notify: bool = typer.Option(
         True, "--notify/--no-notify",
         help="Email a summary of the predictions made (if SMTP is configured in .env).",
+    ),
+    paper_book: bool = typer.Option(
+        True, "--paper/--no-paper",
+        help="Also capture option quotes + open SIMULATED positions for "
+             "whitelisted tickers (paper book, v2; never places orders).",
     ),
 ) -> None:
     """Form and log one forecast per ticker, for Pythia and every baseline."""
@@ -303,6 +363,14 @@ def forecast(
                 label = config.FORECASTER_LABELS.get(fc.forecaster, fc.forecaster)
                 table.add_row(label, f"{fc.probability * 100:.1f}%", state)
             console.print(table)
+            # Paper book rider (v2): quotes + SIMULATED positions from the rows
+            # just logged (read back from the DB). Best-effort and fully
+            # isolated — the forecast record must never fail because the sim did.
+            if paper_book and tk.upper() in config.OPTIONS_WHITELIST:
+                try:
+                    _paper_pass(conn, tk.upper(), anchor_date.isoformat(), horizon)
+                except Exception as exc:  # noqa: BLE001 - sim is best-effort
+                    console.print(f"  [yellow]paper skipped: {exc}[/yellow]")
             console.print(f"  [dim]Pythia: {pres.reasoning}[/dim]")
         except Exception as exc:  # noqa: BLE001 - one bad ticker shouldn't kill the run
             console.print(f"  [red]{tk}: {exc}[/red]")
@@ -604,34 +672,63 @@ def resolve(
 
     if not results:
         console.print("[dim]Nothing due to resolve.[/dim]")
-        return
+    else:
+        table = Table(title=f"Resolution as of {today.isoformat()}", box=box.ASCII)
+        table.add_column("ticker", no_wrap=True)
+        table.add_column("forecaster")
+        table.add_column("resolves_on", no_wrap=True)
+        table.add_column("outcome", no_wrap=True)
+        table.add_column("Brier", justify="right", no_wrap=True)
+        table.add_column("detail")
 
-    table = Table(title=f"Resolution as of {today.isoformat()}", box=box.ASCII)
-    table.add_column("ticker", no_wrap=True)
-    table.add_column("forecaster")
-    table.add_column("resolves_on", no_wrap=True)
-    table.add_column("outcome", no_wrap=True)
-    table.add_column("Brier", justify="right", no_wrap=True)
-    table.add_column("detail")
+        resolved = 0
+        skipped = 0
+        for r in results:
+            if r.status == "resolved":
+                resolved += 1
+                outcome = "[green]TRUE[/green]" if r.outcome == 1.0 else "[red]FALSE[/red]"
+                table.add_row(
+                    r.ticker, config.FORECASTER_LABELS.get(r.forecaster, r.forecaster),
+                    r.resolves_on, outcome, _fmt_brier(r.brier), r.detail,
+                )
+            else:
+                skipped += 1
+                table.add_row(
+                    r.ticker, config.FORECASTER_LABELS.get(r.forecaster, r.forecaster),
+                    r.resolves_on, "[yellow]skipped[/yellow]", "-", r.detail,
+                )
+        console.print(table)
+        console.print(f"\n[bold green]{resolved} resolved[/bold green], {skipped} skipped.")
 
-    resolved = 0
-    skipped = 0
-    for r in results:
-        if r.status == "resolved":
-            resolved += 1
-            outcome = "[green]TRUE[/green]" if r.outcome == 1.0 else "[red]FALSE[/red]"
-            table.add_row(
-                r.ticker, config.FORECASTER_LABELS.get(r.forecaster, r.forecaster),
-                r.resolves_on, outcome, _fmt_brier(r.brier), r.detail,
+    # Paper-book settlement rides resolve (same official-close discipline).
+    # Best-effort: the graded record must never fail because the sim did.
+    try:
+        settles = paper.settle_due(conn, today=today)
+    except Exception as exc:  # noqa: BLE001 - sim is best-effort
+        console.print(f"[yellow]paper settlement failed: {exc}[/yellow]")
+        settles = []
+    if settles:
+        ptable = Table(title="Paper positions settled (simulated)", box=box.ASCII)
+        ptable.add_column("ticker", no_wrap=True)
+        ptable.add_column("forecaster")
+        ptable.add_column("expiry", no_wrap=True)
+        ptable.add_column("result", no_wrap=True)
+        ptable.add_column("detail")
+        n_settled = 0
+        for s in settles:
+            if s.status == "settled":
+                n_settled += 1
+                color = "green" if (s.pnl_per_unit or 0) >= 0 else "red"
+                res = f"[{color}]{s.pnl_per_unit * 100:+.1f}%[/{color}]"
+            else:
+                res = "[yellow]skipped[/yellow]"
+            ptable.add_row(
+                s.ticker, config.FORECASTER_LABELS.get(s.forecaster, s.forecaster),
+                s.expiry_date, res, s.detail,
             )
-        else:
-            skipped += 1
-            table.add_row(
-                r.ticker, config.FORECASTER_LABELS.get(r.forecaster, r.forecaster),
-                r.resolves_on, "[yellow]skipped[/yellow]", "-", r.detail,
-            )
-    console.print(table)
-    console.print(f"\n[bold green]{resolved} resolved[/bold green], {skipped} skipped.")
+        console.print(ptable)
+        console.print(f"[bold green]{n_settled} paper position(s) settled[/bold green] "
+                      f"(simulated; see `pythia pnl`).")
 
 
 # --- review ------------------------------------------------------------------
@@ -780,6 +877,158 @@ def why(
             )
             # markup=False so any brackets in the model's text are shown literally.
             console.print(f"  {r['reasoning']}", style="dim", markup=False)
+
+
+# --- paper-trade -----------------------------------------------------------------
+
+@app.command(name="paper-trade")
+def paper_trade(
+    ticker: Optional[List[str]] = typer.Option(
+        None, "--ticker", "-t",
+        help="Ticker(s) to capture (default: the options whitelist)."),
+    horizon: int = typer.Option(
+        config.DEFAULT_HORIZON_DAYS, "--horizon", "-h",
+        help="Horizon in trading sessions (must match the logged claims)."),
+) -> None:
+    """(Re)capture entry books + open SIMULATED positions for the latest batch.
+
+    The same-evening retry for when the integrated pass in `forecast` failed
+    mid-run. Idempotent: first-written quotes and positions always win, and the
+    entry-window gate refuses any capture past the next session's open — so
+    this cannot be used to backfill older claims (yfinance has no historical
+    chains; a claim either got its book logged at entry time or never trades).
+    """
+    conn = storage.get_connection()
+    tickers = [t.upper() for t in ticker] if ticker else list(config.OPTIONS_WHITELIST)
+    for tk in tickers:
+        if tk not in config.OPTIONS_WHITELIST:
+            console.print(f"[yellow]{tk}: not in OPTIONS_WHITELIST — skipped.[/yellow]")
+            continue
+        anchor = storage.latest_anchor_for(conn, tk, horizon)
+        if anchor is None:
+            console.print(f"[yellow]{tk}: no logged forecasts — run `pythia forecast` first.[/yellow]")
+            continue
+        console.print(f"[bold]{tk}[/bold] anchor {anchor}")
+        try:
+            _paper_pass(conn, tk, anchor, horizon)
+        except Exception as exc:  # noqa: BLE001 - keep going; report per ticker
+            console.print(f"  [yellow]paper skipped: {exc}[/yellow]")
+
+
+# --- pnl -------------------------------------------------------------------------
+
+@app.command()
+def pnl(
+    policy: Optional[str] = typer.Option(
+        None, "--policy", help=f"Only this sizing policy ({'/'.join(config.PAPER_POLICIES)})."),
+    arm: Optional[str] = typer.Option(
+        None, "--arm", "-f", help="Only this forecaster's book."),
+    min_edge: float = typer.Option(
+        0.0, "--min-edge",
+        help="Only positions with |p-0.5| >= this (read-time conviction slice)."),
+    worst_fill: bool = typer.Option(
+        False, "--worst-fill",
+        help="Re-price every entry at the logged ask instead of the mid."),
+    show_open: bool = typer.Option(
+        False, "--open", help="Also list open positions (carried at cost)."),
+    limit: int = typer.Option(40, "--limit", "-n", help="Max open positions to list."),
+) -> None:
+    """The paper-book P&L ladder (SIMULATED options; sizing is a read-time view).
+
+    Caveat up front: this ladder ranks arms on tens of correlated,
+    horizon-mismatched trades — the Brier board remains the record of record;
+    P&L adds a magnitude dimension the probabilities never claimed.
+    """
+    conn = storage.get_connection()
+    rows = storage.fetch_paper_positions(conn, forecaster=arm)
+    if not rows:
+        console.print(
+            "[dim]No paper positions yet. They open during `pythia forecast` "
+            "(whitelisted tickers, usable after-close books — see paper.py's "
+            "timing note) or `pythia paper-trade`.[/dim]")
+        return
+
+    if policy is not None and policy not in config.PAPER_POLICIES:
+        console.print(f"[red]Unknown policy {policy!r} — "
+                      f"one of {', '.join(config.PAPER_POLICIES)}.[/red]")
+        raise typer.Exit(code=1)
+    policies = (policy,) if policy else config.PAPER_POLICIES
+
+    n_settled = sum(1 for r in rows if r["status"] == "settled")
+    anchors = {r["anchor_date"] for r in rows}
+    gaps = sorted({r["expiry_gap_sessions"] for r in rows})
+    console.print(
+        f"[bold]Paper book[/bold] — {len(rows)} positions ({n_settled} settled) "
+        f"over {len(anchors)} anchor date(s); expiry gaps seen: "
+        f"{', '.join(f'{g:+d}s' for g in gaps)}."
+    )
+    console.print(
+        "[dim]Simulated only; entries at the logged after-close mid, settled at "
+        "intrinsic off the official close. Claims within a day and across "
+        "overlapping windows are correlated — effective n is far below the "
+        "trade count. Brier remains the record of record.[/dim]"
+    )
+    console.print(f"[dim]sizing in force: {paper_pnl.policy_descriptor()}"
+                  f"{'  (worst-fill: entries at the ask)' if worst_fill else ''}"
+                  f"{f'  (slice: |p-0.5| >= {min_edge})' if min_edge else ''}[/dim]")
+
+    books = paper_pnl.ladder(rows, policies=policies, min_edge=min_edge,
+                             worst_fill=worst_fill)
+    table = Table(title="P&L ladder (simulated)", box=box.ASCII)
+    table.add_column("forecaster")
+    table.add_column("settled", justify="right")
+    table.add_column("open", justify="right")
+    for pol in policies:
+        if pol in config.KELLY_FRACTIONS:
+            table.add_column(f"{pol} final (maxDD)", justify="right")
+        else:
+            table.add_column(f"{pol} P&L (ROI)", justify="right")
+
+    # Order arms the way config does (Pythia arms first, then the bars).
+    order = {fc: i for i, fc in enumerate(config.ALL_FORECASTERS)}
+    forecasters = sorted({fc for fc, _ in books},
+                         key=lambda fc: order.get(fc, len(order)))
+    for fc in forecasters:
+        first = books[(fc, policies[0])]
+        cells = [config.FORECASTER_LABELS.get(fc, fc),
+                 str(first.trades), str(first.open_trades)]
+        for pol in policies:
+            b = books[(fc, pol)]
+            if pol in config.KELLY_FRACTIONS:
+                if b.terminal is None:
+                    cells.append("-")
+                else:
+                    color = "green" if b.terminal >= config.OPTIONS_BANKROLL_0 else "red"
+                    cells.append(f"[{color}]${b.terminal:,.0f}[/{color}] "
+                                 f"({b.max_drawdown * 100:.0f}%)")
+            else:
+                if b.trades == 0:
+                    cells.append("-")
+                else:
+                    color = "green" if b.pnl >= 0 else "red"
+                    roi = f"{b.roi * 100:+.1f}%" if b.roi is not None else "-"
+                    cells.append(f"[{color}]${b.pnl:+,.0f}[/{color}] ({roi})")
+        table.add_row(*cells)
+    console.print(table)
+
+    if show_open:
+        open_rows = [r for r in rows if r["status"] == "open"]
+        otable = Table(title="Open positions (carried at cost — no unrealized "
+                             "marks, by design)", box=box.ASCII)
+        otable.add_column("ticker", no_wrap=True)
+        otable.add_column("forecaster")
+        otable.add_column("side", no_wrap=True)
+        otable.add_column("strike", justify="right")
+        otable.add_column("expiry", no_wrap=True)
+        otable.add_column("entry mid", justify="right")
+        otable.add_column("p", justify="right")
+        for r in open_rows[:limit]:
+            otable.add_row(
+                r["ticker"], config.FORECASTER_LABELS.get(r["forecaster"], r["forecaster"]),
+                r["side"], f"{r['strike']:.2f}", r["expiry_date"],
+                f"{r['entry_mid']:.2f}", f"{r['probability'] * 100:.0f}%",
+            )
+        console.print(otable)
 
 
 # --- notify ------------------------------------------------------------------

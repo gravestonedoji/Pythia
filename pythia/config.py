@@ -239,6 +239,87 @@ def fred_api_key() -> str | None:
     key = os.environ.get("FRED_API_KEY", "").strip()
     return key or None
 
+# --- Simulated option positions (paper.py / pnl.py; roadmap v2) ----------------
+# SIMULATED ONLY — the hard wall stands. The paper book turns already-logged
+# probabilities into simulated long single ATM options: entered at the logged
+# after-close mid, settled at intrinsic value off the official raw close on
+# expiry (the same close scoring.py grades with — provably correct, stable
+# forever). There is deliberately NO daily mark-to-market of record: a mark
+# from a delayed, often stale/zero-bid after-hours yfinance book would inject
+# unauditable noise into a record whose whole value is honesty. No broker, no
+# orders, no live execution anywhere in this layer.
+#
+# Every arm and bar trades the SAME contract pair at the SAME logged quote —
+# only direction (its own p) and read-time sizing differ — so the P&L ladder
+# is a true mirror of the Brier ladder. P&L is exactly where overconfidence
+# becomes visible (Delphi: $1 -> $0.025 at full Kelly); that visibility is the
+# point, so every forecast trades, not just high-conviction ones (conviction
+# slices are a read-time filter in `pythia pnl`, never a logging gate).
+
+# Watchlist subset with dense listed expiries and tight ATM books. The quote
+# gates below are the real filter; this list just avoids chain fetches for
+# tickers that would never pass them. Deliberately conservative to start —
+# yfinance openInterest is previous-day and often 0 on thin weeklies, so the
+# book will be index-ETF-dominated; widen only after the gates prove out.
+OPTIONS_WHITELIST: list[str] = ["SPY", "QQQ", "IWM", "DIA", "TLT", "GLD"]
+
+# Contract selection. Expiry must sit within this many trading sessions of the
+# claim's resolves_on (kalshi settle-gap precedent; the signed gap is recorded
+# on every position row, never hidden), and the nearest listed strike must sit
+# within this fraction of the anchor close to count as ATM.
+OPTIONS_MAX_EXPIRY_GAP_SESSIONS = 2
+OPTIONS_MAX_ATM_DISTANCE = 0.02
+
+# Quote gates — refuse, don't fudge (a failed gate logs the quote row with
+# usable=0 and the reason; no positions). Spread gate is RELATIVE-dominant:
+# an absolute-dominant cap would invert its intent on cheap premia (a $0.10
+# spread on a $0.30 mid is 33% execution noise). The premium floor rejects
+# books where even the relative gate leaves noise dominating ROI. After-hours
+# books are often one-sided or zero-bid — usable=0 days are expected and
+# honest; a usable paper book wants the capture near the close (~4:00-4:15 ET).
+OPTIONS_MAX_SPREAD_ABS = 0.05     # spread <= max(this, ...) — floor for tiny mids ($)
+OPTIONS_MAX_SPREAD_REL = 0.15     # ... max(..., this fraction of mid)
+OPTIONS_MIN_PREMIUM = 0.20        # minimum usable mid ($)
+OPTIONS_MIN_OPEN_INTEREST = 100   # a book nobody holds is not a market
+
+# Entry honesty gates. The probabilities were computed as of the anchor close,
+# so the entry quote must not embed post-anchor information: the underlying
+# must sit within this fraction of the anchor close at fetch time, AND the
+# fetch must happen before the next session's open (paper.entry_window_ok).
+OPTIONS_MAX_UNDERLYING_DRIFT = 0.005
+
+OPTIONS_THROTTLE_S = 1.0          # polite gap between yfinance chain calls
+
+# The measured sizing ladder (pnl.py) — derived at READ time from immutable
+# position rows, never stored, so the books are reproducible and immune to
+# out-of-order-settlement state corruption. `fixed` and `edge` are
+# non-compounding; the kelly-proxy books compound a bankroll and risk
+# frac * 2|p-0.5| of available cash per trade ("proxy" because an ATM option
+# is only approximately an even-money directional bet). kelly10 (full
+# fraction) exists precisely so an overconfident arm visibly compounds toward
+# ruin. NOTE: these constants parameterize a read-time VIEW — changing them
+# re-renders history under the new policy (the logged rows never change);
+# `pythia pnl` stamps the params in force on its output for that reason.
+OPTIONS_FIXED_STAKE = 100.0       # $ premium per trade (fixed/edge books)
+OPTIONS_BANKROLL_0 = 1000.0       # starting bankroll per compounding book
+PAPER_POLICIES: tuple[str, ...] = ("fixed", "edge", "kelly05", "kelly10")
+KELLY_FRACTIONS: dict[str, float] = {"kelly05": 0.5, "kelly10": 1.0}
+
+
+def option_gates_descriptor() -> str:
+    """Compact record of the gate values in force, stamped on every quote row.
+
+    The gates will be tuned as the book accumulates; each row carrying the
+    gates it was judged under keeps record slices honest across changeovers
+    (same convention as the hmm `em` token and the lessons/macro shas).
+    """
+    return (
+        f"spread<=max({OPTIONS_MAX_SPREAD_ABS},{OPTIONS_MAX_SPREAD_REL}m),"
+        f"prem>={OPTIONS_MIN_PREMIUM},oi>={OPTIONS_MIN_OPEN_INTEREST},"
+        f"atm<={OPTIONS_MAX_ATM_DISTANCE},drift<={OPTIONS_MAX_UNDERLYING_DRIFT},"
+        f"expgap<={OPTIONS_MAX_EXPIRY_GAP_SESSIONS}"
+    )
+
 # --- Market / calendar -------------------------------------------------------
 # NYSE calendar covers SPY/QQQ/IWM (US equity ETFs).
 EXCHANGE = "XNYS"

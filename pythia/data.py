@@ -87,6 +87,21 @@ def trading_days_forward(start: date, n: int) -> date:
         window *= 2  # holiday-dense stretch; widen and retry
 
 
+def session_open_utc(day: date) -> pd.Timestamp:
+    """The market-open timestamp (UTC) of the trading session `day`.
+
+    Used by the paper book's entry-window gate: a quote captured at or after
+    the NEXT session's open embeds post-anchor information and must be refused.
+    """
+    sched = _calendar.schedule(start_date=day, end_date=day)
+    if sched.empty:
+        raise ValueError(f"{day.isoformat()} is not a trading session for {config.EXCHANGE}")
+    open_ts = sched["market_open"].iloc[0]
+    if open_ts.tzinfo is None:
+        open_ts = open_ts.tz_localize("UTC")
+    return open_ts.tz_convert("UTC")
+
+
 def sessions_between(start: date, end: date) -> int:
     """Signed count of trading sessions in (start, end] — 0 when equal,
     negative when `end` is before `start`. Neither endpoint needs to be a

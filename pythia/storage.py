@@ -111,6 +111,69 @@ CREATE TABLE IF NOT EXISTS macro_snapshots (
     series_json   TEXT NOT NULL,          -- canonical {series_id: [[date, value], ...]}
     source        TEXT NOT NULL DEFAULT 'fred_realtime'
 );
+
+-- Paper book, part 1 (paper.py): the option book seen at entry, logged BEFORE
+-- the outcome. One row per claim per side for the SELECTED contract; the audit
+-- trail behind every position AND every gated refusal (usable=0 rows record
+-- why a claim has no positions). `gates` records the gate values in force
+-- (config changeovers stay readable per row). First write wins: a later
+-- re-run sees a different book, and the book the positions were opened on is
+-- the one that stays.
+CREATE TABLE IF NOT EXISTS option_quotes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker          TEXT    NOT NULL,
+    anchor_date     TEXT    NOT NULL,
+    horizon_days    INTEGER NOT NULL,
+    side            TEXT    NOT NULL CHECK (side IN ('C', 'P')),
+    expiry_date     TEXT    NOT NULL,
+    strike          REAL    NOT NULL,
+    bid             REAL,
+    ask             REAL,
+    last            REAL,
+    volume          INTEGER,
+    open_interest   INTEGER,
+    underlying_last REAL,               -- underlying price at fetch (drift-gate input)
+    quoted_at       TEXT    NOT NULL,   -- our fetch time, UTC ISO
+    last_trade_at   TEXT,               -- the contract's own last-trade timestamp
+    usable          INTEGER NOT NULL,   -- 1 = this side passed every quote gate
+    reject_reason   TEXT,               -- the gate that failed (usable=0 rows)
+    gates           TEXT    NOT NULL DEFAULT '',
+    source          TEXT    NOT NULL DEFAULT 'yfinance_delayed',
+    UNIQUE (ticker, anchor_date, horizon_days, side)
+);
+
+-- Paper book, part 2 (paper.py): one SIMULATED long-option position per
+-- (arm, claim). Ties to its forecast row by the same natural key forecasts
+-- are unique on, and to its entry quote by (ticker, anchor_date,
+-- horizon_days, side). Sizing policies are deliberately NOT columns: every
+-- book (fixed/edge/kelly) is a pure function of these immutable pre-outcome
+-- fields, replayed at read time (pnl.py). No broker, no orders — ever.
+CREATE TABLE IF NOT EXISTS paper_positions (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    opened_at           TEXT    NOT NULL,
+    forecaster          TEXT    NOT NULL,
+    ticker              TEXT    NOT NULL,
+    anchor_date         TEXT    NOT NULL,
+    horizon_days        INTEGER NOT NULL,
+    resolves_on         TEXT    NOT NULL,
+    probability         REAL    NOT NULL,  -- audit copy of the LOGGED forecast row's p
+    side                TEXT    NOT NULL CHECK (side IN ('C', 'P')),
+    expiry_date         TEXT    NOT NULL,
+    expiry_gap_sessions INTEGER NOT NULL,  -- signed, kalshi convention; recorded not hidden
+    strike              REAL    NOT NULL,
+    entry_bid           REAL    NOT NULL,
+    entry_ask           REAL    NOT NULL,
+    entry_mid           REAL    NOT NULL,
+    entry_quoted_at     TEXT    NOT NULL,
+    status              TEXT    NOT NULL DEFAULT 'open',  -- open | settled
+    settled_at          TEXT,
+    settle_close        REAL,               -- official raw close on expiry_date
+    intrinsic           REAL,               -- max(0, S-K) / max(0, K-S)
+    pnl_per_unit        REAL,               -- return on premium: intrinsic/entry_mid - 1
+    UNIQUE (forecaster, ticker, anchor_date, horizon_days)
+);
+CREATE INDEX IF NOT EXISTS idx_paper_positions_status ON paper_positions (status);
+CREATE INDEX IF NOT EXISTS idx_paper_positions_expiry ON paper_positions (expiry_date);
 """
 
 
@@ -120,6 +183,9 @@ def get_connection(path: str | Path | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(db)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # Read commands (pnl/alerts/publish) may run while a forecast/resolve pass
+    # is writing; wait briefly instead of throwing "database is locked".
+    conn.execute("PRAGMA busy_timeout = 5000")
     init_db(conn)
     return conn
 
@@ -302,3 +368,152 @@ def fetch_macro_snapshot(
         (anchor_date,),
     )
     return cur.fetchone()
+
+
+def fetch_claim_rows(
+    conn: sqlite3.Connection, ticker: str, anchor_date: str, horizon_days: int
+) -> list[sqlite3.Row]:
+    """Every forecaster's LOGGED row for one claim. The paper book opens
+    positions from these — never from in-memory results — so it can only
+    mirror the record."""
+    cur = conn.execute(
+        """
+        SELECT * FROM forecasts
+        WHERE ticker = ? AND anchor_date = ? AND horizon_days = ?
+        ORDER BY forecaster
+        """,
+        (ticker, anchor_date, horizon_days),
+    )
+    return cur.fetchall()
+
+
+def latest_anchor_for(
+    conn: sqlite3.Connection, ticker: str, horizon_days: int
+) -> str | None:
+    """The most recent anchor date with logged forecasts for this ticker."""
+    cur = conn.execute(
+        "SELECT MAX(anchor_date) FROM forecasts WHERE ticker = ? AND horizon_days = ?",
+        (ticker, horizon_days),
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+# --- Paper book (paper.py / pnl.py) ---------------------------------------------
+
+def insert_option_quote(
+    conn: sqlite3.Connection, ticker: str, anchor_date: str, horizon_days: int,
+    q: dict, *, usable: bool, reject_reason: str | None, gates: str,
+) -> int | None:
+    """Log one side of the entry book (usable or refused — both are the audit
+    trail). First write wins per (ticker, anchor_date, horizon, side)."""
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO option_quotes (
+            ticker, anchor_date, horizon_days, side, expiry_date, strike,
+            bid, ask, last, volume, open_interest, underlying_last,
+            quoted_at, last_trade_at, usable, reject_reason, gates
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            ticker, anchor_date, horizon_days, q["side"], q["expiry_date"],
+            q["strike"], q["bid"], q["ask"], q["last"], q["volume"],
+            q["open_interest"], q["underlying_last"], q["quoted_at"],
+            q["last_trade_at"], int(usable), reject_reason, gates,
+        ),
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        return None  # duplicate, ignored
+    return cur.lastrowid
+
+
+def fetch_quote_pair(
+    conn: sqlite3.Connection, ticker: str, anchor_date: str, horizon_days: int
+) -> dict[str, sqlite3.Row]:
+    """The logged entry book for one claim, keyed 'C'/'P' (empty if never quoted)."""
+    cur = conn.execute(
+        """
+        SELECT * FROM option_quotes
+        WHERE ticker = ? AND anchor_date = ? AND horizon_days = ?
+        """,
+        (ticker, anchor_date, horizon_days),
+    )
+    return {row["side"]: row for row in cur.fetchall()}
+
+
+def insert_paper_position(conn: sqlite3.Connection, pos) -> int | None:
+    """Insert an open paper position (paper.PaperPosition). First write wins
+    per (forecaster, ticker, anchor_date, horizon) — same key as forecasts."""
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO paper_positions (
+            opened_at, forecaster, ticker, anchor_date, horizon_days,
+            resolves_on, probability, side, expiry_date, expiry_gap_sessions,
+            strike, entry_bid, entry_ask, entry_mid, entry_quoted_at, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            pos.opened_at, pos.forecaster, pos.ticker, pos.anchor_date,
+            pos.horizon_days, pos.resolves_on, pos.probability, pos.side,
+            pos.expiry_date, pos.expiry_gap_sessions, pos.strike,
+            pos.entry_bid, pos.entry_ask, pos.entry_mid, pos.entry_quoted_at,
+            pos.status,
+        ),
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        return None  # duplicate, ignored
+    return cur.lastrowid
+
+
+def fetch_open_positions_due(conn: sqlite3.Connection, cutoff: date) -> list[sqlite3.Row]:
+    """Open paper positions whose expiry is on or before `cutoff`."""
+    cur = conn.execute(
+        """
+        SELECT * FROM paper_positions
+        WHERE status = 'open' AND expiry_date <= ?
+        ORDER BY expiry_date, ticker, forecaster
+        """,
+        (cutoff.isoformat(),),
+    )
+    return cur.fetchall()
+
+
+def mark_position_settled(
+    conn: sqlite3.Connection, position_id: int, *,
+    settle_close: float, intrinsic: float, pnl_per_unit: float,
+    settled_at: str | None = None,
+) -> None:
+    """Settle a paper position at intrinsic value off the official close."""
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET status = 'settled', settle_close = ?, intrinsic = ?,
+            pnl_per_unit = ?, settled_at = ?
+        WHERE id = ?
+        """,
+        (settle_close, intrinsic, pnl_per_unit, settled_at or now_iso(), position_id),
+    )
+    conn.commit()
+
+
+def fetch_paper_positions(
+    conn: sqlite3.Connection, forecaster: str | None = None,
+    status: str | None = None,
+) -> list[sqlite3.Row]:
+    """Paper positions, oldest anchor first (the order replays need)."""
+    clauses, params = [], []
+    if forecaster is not None:
+        clauses.append("forecaster = ?")
+        params.append(forecaster)
+    if status is not None:
+        clauses.append("status = ?")
+        params.append(status)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    cur = conn.execute(
+        f"SELECT * FROM paper_positions {where} "
+        "ORDER BY anchor_date, ticker, forecaster",
+        params,
+    )
+    return cur.fetchall()
