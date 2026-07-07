@@ -367,6 +367,29 @@ FORECASTER_LABELS: dict[str, str] = {
 REFLECT_MIN_RESOLVED = 25
 REFLECT_MAX_LESSONS = 8
 
+# --- High-conviction digest (digest.py; roadmap v3, second half) ----------------
+# |P - 0.5| >= this flags a call for the daily digest. 0.15 sat at the visible
+# cliff of the early record when chosen (2026-07-07, 410 resolved raw:
+# 0.10-0.15 graded ~60% hit / Brier 0.240; >=0.15 graded 11/12 raw and 6/6
+# coached, at ~1 flagged day per week) — but that selection is POST-HOC on the
+# record it summarizes, with n~12 over correlated windows (USO alone flagged 4
+# overlapping batches). The digest_alerts table is the rule's out-of-sample
+# test: every flag is logged forward with the config in force. Revisit is
+# PRE-REGISTERED at 30 resolved alerts, not "when it feels right".
+ALERT_CONVICTION_MIN = 0.15
+
+# Arms whose own probability can trip a flag: the live LLM arms only. Iso arms
+# are excluded because their conviction is a remap artifact at this record
+# size (the current PAV fit caps every output below 0.5; Delphi measured
+# isotonic unreliable at n~200-400). Baselines are excluded because bars grade
+# the product, they don't page the human (the HMM's confident calls graded
+# 38.9% hit / Brier 0.336 on the early record). Changing this set segments the
+# alert record — each alert row stores the gate arms in force.
+ALERT_GATE_ARMS: list[str] = [PYTHIA, PYTHIA_COACHED, PYTHIA_MACRO]
+
+# Subject-line token on flagged days — ASCII, rare (~weekly), inbox-searchable.
+ALERT_SUBJECT_TAG = "HIGH-CONVICTION"
+
 # --- Isotonic calibration (calibrate.py) ----------------------------------------
 # Below this many resolved rows the remap overfits noise (measured in Delphi:
 # isotonic HURT at ~200-400 training points, shone at ~1,700) — the derived

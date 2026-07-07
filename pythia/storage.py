@@ -174,6 +174,30 @@ CREATE TABLE IF NOT EXISTS paper_positions (
 );
 CREATE INDEX IF NOT EXISTS idx_paper_positions_status ON paper_positions (status);
 CREATE INDEX IF NOT EXISTS idx_paper_positions_expiry ON paper_positions (expiry_date);
+
+-- High-conviction alert log (digest.py): one row per claim the digest rule
+-- flagged AT ISSUE TIME, with the threshold AND gate arms in force — the rule
+-- drifts over the project's life, and "what was actually surfaced" must be a
+-- point-in-time record, not a retro-derivation under today's config. Written
+-- even when no email goes out (emailed_at NULL = logged, not delivered).
+-- Outcomes are NEVER stored here: grade by joining flagged_by's arms to
+-- forecasts (digest.alert_scoreboard) — one grading path, scoring.py's.
+-- First-write-wins, live-only, no backfill (kalshi precedent).
+CREATE TABLE IF NOT EXISTS digest_alerts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at    TEXT    NOT NULL,
+    ticker        TEXT    NOT NULL,
+    anchor_date   TEXT    NOT NULL,
+    horizon_days  INTEGER NOT NULL,
+    resolves_on   TEXT    NOT NULL,
+    direction     TEXT    NOT NULL,          -- 'UP' | 'DOWN' (most extreme gating arm)
+    probability   REAL    NOT NULL,          -- that arm's p at issue
+    flagged_by    TEXT    NOT NULL,          -- comma-joined arms that crossed the line
+    threshold     REAL    NOT NULL,          -- ALERT_CONVICTION_MIN in force at issue
+    gate_arms     TEXT    NOT NULL,          -- ALERT_GATE_ARMS in force at issue
+    emailed_at    TEXT,
+    UNIQUE (ticker, anchor_date, horizon_days)
+);
 """
 
 
@@ -494,6 +518,55 @@ def mark_position_settled(
         WHERE id = ?
         """,
         (settle_close, intrinsic, pnl_per_unit, settled_at or now_iso(), position_id),
+    )
+    conn.commit()
+
+
+# --- High-conviction alert log (digest.py) --------------------------------------
+
+def insert_digest_alert(
+    conn: sqlite3.Connection, *, ticker: str, anchor_date: str,
+    horizon_days: int, resolves_on: str, direction: str, probability: float,
+    flagged_by: str, threshold: float, gate_arms: str,
+) -> int | None:
+    """Log one flagged claim with the rule config in force. First write wins
+    per (ticker, anchor_date, horizon) — the alert record is point-in-time."""
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO digest_alerts (
+            created_at, ticker, anchor_date, horizon_days, resolves_on,
+            direction, probability, flagged_by, threshold, gate_arms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (now_iso(), ticker, anchor_date, horizon_days, resolves_on,
+         direction, probability, flagged_by, threshold, gate_arms),
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        return None  # duplicate, ignored
+    return cur.lastrowid
+
+
+def fetch_digest_alerts(
+    conn: sqlite3.Connection, ticker: str | None = None
+) -> list[sqlite3.Row]:
+    """All logged alerts (optionally one ticker), oldest first."""
+    if ticker is None:
+        cur = conn.execute(
+            "SELECT * FROM digest_alerts ORDER BY anchor_date, ticker")
+    else:
+        cur = conn.execute(
+            "SELECT * FROM digest_alerts WHERE ticker = ? ORDER BY anchor_date",
+            (ticker,),
+        )
+    return cur.fetchall()
+
+
+def mark_alert_emailed(conn: sqlite3.Connection, alert_id: int) -> None:
+    """Record that a human was actually notified of this alert."""
+    conn.execute(
+        "UPDATE digest_alerts SET emailed_at = ? WHERE id = ? AND emailed_at IS NULL",
+        (now_iso(), alert_id),
     )
     conn.commit()
 

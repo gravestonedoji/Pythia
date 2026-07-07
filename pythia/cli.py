@@ -30,8 +30,8 @@ from rich.console import Console
 from rich.table import Table
 
 from . import (
-    baselines, calibrate, config, data, forecaster, hmm_baseline, hmm_health,
-    kalshi, macro, paper, reflect, scoring, storage,
+    baselines, calibrate, config, data, digest, forecaster, hmm_baseline,
+    hmm_health, kalshi, macro, paper, reflect, scoring, storage,
 )
 from . import notify as notifier  # aliased: the `notify` command below would shadow it
 from . import pnl as paper_pnl    # aliased: the `pnl` command below would shadow it
@@ -163,8 +163,11 @@ def forecast(
     ),
 ) -> None:
     """Form and log one forecast per ticker, for Pythia and every baseline."""
-    tickers = ticker or config.WATCHLIST
+    # Normalize case: the record stores uppercase tickers (review/kalshi/paper
+    # all match on the uppercase form).
+    tickers = [t.upper() for t in ticker] if ticker else config.WATCHLIST
     notifications: list[notifier.Prediction] = []
+    batch_keys: list[tuple[str, str, int]] = []  # (ticker, anchor, horizon) logged this run
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
         console.print(
@@ -363,12 +366,13 @@ def forecast(
                 label = config.FORECASTER_LABELS.get(fc.forecaster, fc.forecaster)
                 table.add_row(label, f"{fc.probability * 100:.1f}%", state)
             console.print(table)
+            batch_keys.append((tk, anchor_date.isoformat(), horizon))
             # Paper book rider (v2): quotes + SIMULATED positions from the rows
             # just logged (read back from the DB). Best-effort and fully
             # isolated — the forecast record must never fail because the sim did.
-            if paper_book and tk.upper() in config.OPTIONS_WHITELIST:
+            if paper_book and tk in config.OPTIONS_WHITELIST:
                 try:
-                    _paper_pass(conn, tk.upper(), anchor_date.isoformat(), horizon)
+                    _paper_pass(conn, tk, anchor_date.isoformat(), horizon)
                 except Exception as exc:  # noqa: BLE001 - sim is best-effort
                     console.print(f"  [yellow]paper skipped: {exc}[/yellow]")
             console.print(f"  [dim]Pythia: {pres.reasoning}[/dim]")
@@ -377,14 +381,60 @@ def forecast(
 
     console.print(f"\n[bold green]Done.[/bold green] {issued} logged, {skipped} already present.")
 
+    # v3 digest: flags computed from the LOGGED rows of this batch (read back
+    # from the DB — an alert must never carry a probability that matches no
+    # row in the record) and logged to digest_alerts REGARDLESS of whether an
+    # email goes out: the record is about the rule; emailed_at records
+    # delivery. Best-effort like everything on the alerting side.
+    digest_text: Optional[str] = None
+    n_flagged = 0
+    alert_ids: list[int] = []
+    try:
+        prior_alerts = storage.fetch_digest_alerts(conn)
+        batch_rows = []
+        for key in batch_keys:
+            batch_rows.extend(storage.fetch_claim_rows(conn, *key))
+        flagged = digest.build_flagged_calls(batch_rows, prior_alerts)
+        for c in flagged:
+            rid = storage.insert_digest_alert(
+                conn, ticker=c.ticker, anchor_date=c.anchor_date,
+                horizon_days=c.horizon_days, resolves_on=c.resolves_on,
+                direction=c.direction, probability=c.probability,
+                flagged_by=",".join(c.flagged_by),
+                threshold=config.ALERT_CONVICTION_MIN,
+                gate_arms=",".join(config.ALERT_GATE_ARMS),
+            )
+            if rid is None:  # already logged; re-mark delivery only if unmailed
+                for a in storage.fetch_digest_alerts(conn, c.ticker):
+                    if (a["anchor_date"] == c.anchor_date
+                            and a["horizon_days"] == c.horizon_days
+                            and a["emailed_at"] is None):
+                        rid = a["id"]
+            if rid is not None:
+                alert_ids.append(rid)
+        n_flagged = len(flagged)
+        pooled, per_arm = digest.alert_scoreboard(
+            storage.fetch_digest_alerts(conn), storage.fetch_all(conn))
+        digest_text = digest.format_digest_sections(flagged, pooled, per_arm)
+        if flagged:
+            console.print(
+                f"[bold yellow]{n_flagged} high-conviction call(s) flagged[/bold yellow] "
+                "— logged to the alert record (`pythia alerts`); surfaced for "
+                "manual review only.")
+    except Exception as exc:  # noqa: BLE001 - alerting must not break a logged run
+        console.print(f"[yellow]digest pass failed: {exc}[/yellow]")
+
     # Email is best-effort: a logged run must never fail because alerting did.
     if notify and notifications:
         try:
             sent = notifier.notify_predictions(
                 notifications, issued_on=date.today().isoformat(), horizon_days=horizon,
+                digest=digest_text, n_flagged=n_flagged,
             )
             if sent:
                 console.print(f"[green]Emailed {len(notifications)} prediction(s).[/green]")
+                for aid in alert_ids:
+                    storage.mark_alert_emailed(conn, aid)
             else:
                 console.print(
                     "[dim]Email not configured — set PYTHIA_SMTP_USER and "
@@ -1079,10 +1129,103 @@ def notify(
         )
         for r in batch
     ]
+
+    # Digest for the re-send. Batches with LOGGED alerts render them verbatim
+    # (never recomputed under today's config); batches without any recompute
+    # for display only, labeled as reconstructed if anything turns up. No
+    # alert rows are ever written from this path — no backfill.
+    digest_text = None
+    n_flagged = 0
+    try:
+        all_rows = storage.fetch_all(conn)
+        alerts_all = storage.fetch_digest_alerts(conn)
+        batch_keys = {(r["ticker"], r["anchor_date"], r["horizon_days"])
+                      for r in batch}
+        batch_claim_rows = []
+        for tk, ad, hz in batch_keys:
+            batch_claim_rows.extend(storage.fetch_claim_rows(conn, tk, ad, hz))
+        logged = [a for a in alerts_all
+                  if (a["ticker"], a["anchor_date"], a["horizon_days"]) in batch_keys]
+        if logged:
+            flagged = digest.flagged_from_alert_rows(logged, batch_claim_rows)
+            reconstructed = False
+        else:
+            flagged = digest.build_flagged_calls(batch_claim_rows, alerts_all)
+            reconstructed = bool(flagged)
+        pooled, per_arm = digest.alert_scoreboard(alerts_all, all_rows)
+        digest_text = digest.format_digest_sections(
+            flagged, pooled, per_arm, reconstructed=reconstructed)
+        n_flagged = len(flagged)
+    except Exception as exc:  # noqa: BLE001 - the batch email still goes out
+        console.print(f"[yellow]digest rebuild failed: {exc}[/yellow]")
+
     notifier.notify_predictions(
         preds, issued_on=target, horizon_days=batch[0]["horizon_days"],
+        digest=digest_text, n_flagged=n_flagged,
     )
     console.print(f"[green]Emailed {len(preds)} prediction(s) from {target}.[/green]")
+
+
+# --- alerts ------------------------------------------------------------------
+
+@app.command()
+def alerts(
+    ticker: Optional[str] = typer.Option(None, "--ticker", "-t", help="Only this ticker."),
+    limit: int = typer.Option(40, "--limit", "-n", help="Max alert rows to show."),
+) -> None:
+    """The high-conviction alert log and the rule's own gradeable record.
+
+    Every flag the digest rule fired, with the config in force when it fired,
+    graded by joining back to the forecasts table (one grading path). The
+    per-arm breakdown is the honest read — the pooled line mixes up to three
+    rules per claim. Threshold revisit is pre-registered at 30 resolved alerts.
+    """
+    conn = storage.get_connection()
+    rows = storage.fetch_digest_alerts(conn, ticker.upper() if ticker else None)
+    if not rows:
+        console.print("[dim]No alerts logged yet. Flags are logged by "
+                      "`pythia forecast` when a live LLM arm crosses "
+                      f"|P-0.5| >= {config.ALERT_CONVICTION_MIN}.[/dim]")
+        return
+
+    all_rows = storage.fetch_all(conn)
+    pooled, per_arm = digest.alert_scoreboard(
+        storage.fetch_digest_alerts(conn), all_rows)
+    console.print(
+        f"[bold]Alert rule record[/bold] (out-of-sample test of the threshold; "
+        f"revisit pre-registered at 30 resolved alerts):")
+    console.print(f"  pooled: {digest._fmt_stats(pooled)} (coin = 0.250)")
+    for arm in sorted(per_arm):
+        console.print(f"  {arm}: {digest._fmt_stats(per_arm[arm])}")
+
+    outcomes = {}
+    for r in all_rows:
+        if r["status"] == "resolved":
+            outcomes[(r["ticker"], r["anchor_date"], r["horizon_days"])] = r["outcome"]
+
+    table = Table(title=f"Alert log (showing up to {limit}, newest first)", box=box.ASCII)
+    table.add_column("created", no_wrap=True)
+    table.add_column("ticker", no_wrap=True)
+    table.add_column("dir", no_wrap=True)
+    table.add_column("P", justify="right", no_wrap=True)
+    table.add_column("flagged by")
+    table.add_column("thr", justify="right", no_wrap=True)
+    table.add_column("emailed", no_wrap=True)
+    table.add_column("outcome", no_wrap=True)
+    for a in list(reversed(rows))[:limit]:
+        out = outcomes.get((a["ticker"], a["anchor_date"], a["horizon_days"]))
+        if out is None:
+            verdict = "[dim]pending[/dim]"
+        else:
+            correct = (a["direction"] == "UP") == (out == 1.0)
+            verdict = "[green]correct[/green]" if correct else "[red]wrong[/red]"
+        table.add_row(
+            a["anchor_date"], a["ticker"], a["direction"],
+            f"{a['probability'] * 100:.0f}%", a["flagged_by"],
+            f"{a['threshold']:.2f}",
+            "yes" if a["emailed_at"] else "[dim]no[/dim]", verdict,
+        )
+    console.print(table)
 
 
 if __name__ == "__main__":

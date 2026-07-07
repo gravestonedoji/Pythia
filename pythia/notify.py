@@ -38,16 +38,28 @@ def _direction(probability: float) -> str:
     return "UP" if probability >= 0.5 else "DOWN"
 
 
-def format_subject(predictions: list[Prediction], *, issued_on: str) -> str:
+def format_subject(predictions: list[Prediction], *, issued_on: str,
+                   n_flagged: int = 0) -> str:
     n = len(predictions)
     ups = sum(1 for p in predictions if p.probability >= 0.5)
-    return f"Pythia {issued_on}: {n} forecasts ({ups} up / {n - ups} down)"
+    base = f"Pythia {issued_on}: {n} forecasts ({ups} up / {n - ups} down)"
+    if n_flagged > 0:
+        # Rarity (~weekly at the current threshold) is what makes the tag
+        # stand out; non-flagged days keep the plain subject unchanged.
+        return f"Pythia {issued_on}: {n_flagged} {config.ALERT_SUBJECT_TAG} | " \
+               f"{n} forecasts ({ups} up / {n - ups} down)"
+    return base
 
 
 def format_body(
-    predictions: list[Prediction], *, issued_on: str, horizon_days: int
+    predictions: list[Prediction], *, issued_on: str, horizon_days: int,
+    digest: str | None = None,
 ) -> str:
-    """Plain-text summary, most bullish first (mirrors the `why` command order)."""
+    """Plain-text summary, most bullish first (mirrors the `why` command order).
+
+    `digest` (digest.format_digest_sections) is prepended when given — one
+    combined email, so a quiet digest is visibly quiet rather than missing.
+    """
     lines = [
         f"Pythia predictions issued {issued_on}",
         f"P(up) = chance the ETF closes at or above its anchor price over "
@@ -55,6 +67,8 @@ def format_body(
         "'anchor' is the price when the call was made — what the claim is measured against.",
         "",
     ]
+    if digest:
+        lines = [digest.rstrip(), "", "=" * 60, ""] + lines
     for p in sorted(predictions, key=lambda r: -r.probability):
         lines.append(
             f"{_direction(p.probability):<4} {p.ticker:<5} "
@@ -93,12 +107,15 @@ def notify_predictions(
     *,
     issued_on: str,
     horizon_days: int,
+    digest: str | None = None,
+    n_flagged: int = 0,
     cfg: config.EmailConfig | None = None,
 ) -> bool:
     """Email a batch summary. No-op (returns False) if there's nothing to send
     or email isn't configured."""
     if not predictions:
         return False
-    subject = format_subject(predictions, issued_on=issued_on)
-    body = format_body(predictions, issued_on=issued_on, horizon_days=horizon_days)
+    subject = format_subject(predictions, issued_on=issued_on, n_flagged=n_flagged)
+    body = format_body(predictions, issued_on=issued_on,
+                       horizon_days=horizon_days, digest=digest)
     return send_email(subject, body, cfg=cfg)

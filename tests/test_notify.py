@@ -81,3 +81,31 @@ def test_notify_predictions_no_send_when_unconfigured(monkeypatch):
 
 def test_notify_predictions_empty_is_false():
     assert notify.notify_predictions([], issued_on="2026-06-01", horizon_days=5) is False
+
+
+# --- v3 digest integration (subject tag + prepended sections) --------------------
+
+def test_subject_unchanged_when_nothing_flagged():
+    plain = notify.format_subject(_preds(), issued_on="2026-06-01")
+    with_zero = notify.format_subject(_preds(), issued_on="2026-06-01", n_flagged=0)
+    assert with_zero == plain
+
+
+def test_subject_carries_the_high_conviction_tag():
+    subject = notify.format_subject(_preds(), issued_on="2026-06-01", n_flagged=2)
+    assert subject.startswith(f"Pythia 2026-06-01: 2 {config.ALERT_SUBJECT_TAG} | ")
+    assert "3 forecasts (2 up / 1 down)" in subject
+
+
+def test_body_without_digest_is_byte_identical_to_before():
+    plain = notify.format_body(_preds(), issued_on="2026-06-01", horizon_days=5)
+    with_none = notify.format_body(_preds(), issued_on="2026-06-01",
+                                   horizon_days=5, digest=None)
+    assert with_none == plain
+
+
+def test_body_renders_digest_above_the_prediction_list():
+    body = notify.format_body(_preds(), issued_on="2026-06-01", horizon_days=5,
+                              digest="2 HIGH-CONVICTION CALLS\n...")
+    assert body.index("HIGH-CONVICTION") < body.index("SPY")
+    assert "Pythia predictions issued 2026-06-01" in body
