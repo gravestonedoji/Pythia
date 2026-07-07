@@ -97,6 +97,20 @@ CREATE TABLE IF NOT EXISTS hmm_fits (
     UNIQUE (ticker, anchor_date)
 );
 CREATE INDEX IF NOT EXISTS idx_hmm_fits_ticker ON hmm_fits (ticker, anchor_date);
+
+-- Macro snapshots (macro.py): one point-in-time FRED snapshot per anchor date,
+-- shared across every ticker anchored that day (macro is per-date, not
+-- per-ticker). The series payload is content-hashed so the macro arm's
+-- `model` column (+macro:<sha>) ties any forecast row to the exact macro data
+-- it saw. First-write-wins like forecasts/hmm_fits — the vintage for a given
+-- anchor date never changes, so a re-fetch is an idempotent no-op.
+CREATE TABLE IF NOT EXISTS macro_snapshots (
+    anchor_date   TEXT PRIMARY KEY,
+    fetched_at    TEXT NOT NULL,
+    context_sha   TEXT NOT NULL,
+    series_json   TEXT NOT NULL,          -- canonical {series_id: [[date, value], ...]}
+    source        TEXT NOT NULL DEFAULT 'fred_realtime'
+);
 """
 
 
@@ -255,3 +269,36 @@ def fetch_hmm_fits(
             (ticker,),
         )
     return cur.fetchall()
+
+
+# --- Macro snapshots (macro.py) -----------------------------------------------
+
+def insert_macro_snapshot(
+    conn: sqlite3.Connection, snap
+) -> int | None:
+    """Persist a point-in-time macro snapshot. First write wins per anchor_date
+    (idempotent) — the vintage for a given anchor date never changes."""
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO macro_snapshots
+            (anchor_date, fetched_at, context_sha, series_json, source)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (snap.anchor_date, snap.fetched_at, snap.context_sha,
+         snap.series_json(), snap.source),
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        return None  # duplicate anchor_date, ignored
+    return cur.lastrowid
+
+
+def fetch_macro_snapshot(
+    conn: sqlite3.Connection, anchor_date: str
+) -> sqlite3.Row | None:
+    """The macro snapshot for one anchor date, or None if none was recorded."""
+    cur = conn.execute(
+        "SELECT * FROM macro_snapshots WHERE anchor_date = ?",
+        (anchor_date,),
+    )
+    return cur.fetchone()

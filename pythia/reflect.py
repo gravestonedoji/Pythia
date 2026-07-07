@@ -181,7 +181,34 @@ def distill_lessons(rows, client=None, *, model: str | None = None) -> tuple[str
             break
     if payload is None:
         raise RuntimeError("review model did not return a submit_lessons call")
-    lessons = [str(s).strip() for s in payload["lessons"] if str(s).strip()]
+    raw_lessons = payload.get("lessons")
+    diagnosis = str(payload.get("diagnosis", "")).strip()
+    # Models occasionally return the lessons as a single string instead of an
+    # array, or smoosh both fields into the diagnosis with pseudo-XML parameter
+    # tags. Recover both shapes so a flaky tool call still produces lessons
+    # rather than crashing the weekly review (the diagnosis + a real lesson
+    # surfaced is better than no lesson at all and the arm never switching on).
+    if isinstance(raw_lessons, str) and raw_lessons.strip():
+        raw_lessons = [raw_lessons]
+    elif (not isinstance(raw_lessons, list) or not raw_lessons) and diagnosis:
+        # `diagnosis` sometimes ends with "</parameter>\n<parameter name=\"lessons\">X"
+        # — split the diagnosis off at that marker and take the rest as one lesson.
+        import re
+        m = re.search(r'</parameter>\s*<parameter\s+name="lessons">\s*(.*)$',
+                      diagnosis, re.DOTALL | re.IGNORECASE)
+        if m:
+            diagnosis = (diagnosis[:m.start()].strip()
+                          if m.start() > 0 else diagnosis)
+            raw_lessons = [m.group(1).strip()]
+    if not isinstance(raw_lessons, list) or not raw_lessons:
+        raise RuntimeError(
+            "review model returned a submit_lessons call with no lessons; "
+            f"payload was: {payload!r}")
+    lessons = [str(s).strip() for s in raw_lessons if str(s).strip()]
     lessons = lessons[: config.REFLECT_MAX_LESSONS]
+    if not lessons:
+        raise RuntimeError(
+            "review model returned a submit_lessons call but every lesson was "
+            f"empty; payload was: {payload!r}")
     text = "\n".join(f"- {s}" for s in lessons)
-    return str(payload.get("diagnosis", "")).strip(), text
+    return diagnosis, text

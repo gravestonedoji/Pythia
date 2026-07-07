@@ -9,6 +9,12 @@ inflation, the Fed, news) because the model cannot see today's values and stale
 pretraining macro is worse than none. This makes price-only Pythia a clean
 ablation baseline: when v1 adds real macro (FRED), its Brier can be measured
 against this version rather than assumed better.
+
+v1 (macro.py) is now here as a SEPARATE arm, ``pythia_macro``: identical claim,
+identical price data, the ONLY difference is a point-in-time macro block in the
+prompt and a system prompt that lifts the price-only restriction. The raw
+``pythia`` arm stays price-only forever, so the macro effect stays measured on
+identical claims for the life of the project.
 """
 
 from __future__ import annotations
@@ -42,6 +48,39 @@ Submit your answer by calling the submit_forecast tool. Keep the reasoning \
 concise (a few sentences) and grounded only in the provided price action."""
 
 
+# The v1 macro arm's contract: the price-only restriction is LIFTED and the
+# model may reason from the macro block too — but ONLY from the values shown
+# (no recalling macro from training, which may be stale), and still no news,
+# events, or headlines (which it cannot see). Calibration discipline unchanged.
+_SYSTEM_TEMPLATE_MACRO = """\
+You are Pythia, a disciplined short-horizon market forecaster. You produce \
+*calibrated* probabilities for falsifiable claims about liquid, broad-based \
+ETFs, using the PRICE/VOLUME data AND the MACRO DATA BLOCK provided to you.
+
+HARD RULES — follow them exactly:
+- Reason from (1) the price action, momentum, volume, and price structure and \
+(2) the macro readings in the MACRO DATA BLOCK (Treasury yields, the yield \
+curve, breakeven inflation, credit spreads, volatility, and the dollar). These \
+two blocks are the entirety of your evidence.
+- Use ONLY the macro values shown in the block. Do NOT recall or infer macro \
+readings from your training — they may be stale or wrong. The block is your \
+single source for macro.
+- You must NOT reason about specific news events, earnings, elections, jobs \
+reports, central-bank decisions, or geopolitics. You do NOT have today's \
+headlines. Any such knowledge from your training is STALE, and using it is \
+worse than ignoring it: a confident guess about today's news from old data is \
+a trap. Do not use it or mention it.
+- Be calibrated, not dramatic. {drift_prior} Reserve confident probabilities \
+for genuinely strong, clear signals across the price and macro data. Avoid \
+false precision.
+- "probability" is your probability that the claim is TRUE over the stated \
+horizon, as a number between 0 and 1.
+
+Submit your answer by calling the submit_forecast tool. Keep the reasoning \
+concise (a few sentences) and grounded only in the provided price action and \
+macro data."""
+
+
 # The neutral directional prior depends on the asset class. Broad equity ETFs
 # have a structural long-run up-drift (a data-free, non-macro fact); commodities,
 # bonds, and crypto funds do not, so they must not be nudged upward.
@@ -60,32 +99,53 @@ _DRIFT_PRIOR = {
 }
 
 
-def build_system_prompt(asset_cls: str) -> str:
-    """System prompt with the directional prior matched to the asset class."""
-    prior = _DRIFT_PRIOR.get(asset_cls, _DRIFT_PRIOR[config.NON_EQUITY])
-    return _SYSTEM_TEMPLATE.format(drift_prior=prior)
+def build_system_prompt(asset_cls: str, *, macro: bool = False) -> str:
+    """System prompt with the directional prior matched to the asset class.
 
-_TOOL = {
-    "name": "submit_forecast",
-    "description": "Record your calibrated probability and reasoning for the claim.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "probability": {
-                "type": "number",
-                "description": "Your P(claim is TRUE), a number between 0 and 1.",
+    ``macro=True`` selects the v1 macro-arm prompt, which lifts the price-only
+    restriction so the model may reason from the macro block too. The raw arm
+    always uses the price-only prompt — the ablation stays clean.
+    """
+    prior = _DRIFT_PRIOR.get(asset_cls, _DRIFT_PRIOR[config.NON_EQUITY])
+    tmpl = _SYSTEM_TEMPLATE_MACRO if macro else _SYSTEM_TEMPLATE
+    return tmpl.format(drift_prior=prior)
+
+
+def _build_tool(*, macro: bool = False) -> dict:
+    """The submit_forecast tool, with the reasoning guardrail matched to the arm.
+
+    The base arm's reasoning must stay price-only; the macro arm's may use the
+    macro block. Both still forbid news/events/headlines (never visible).
+    """
+    reason_desc = (
+        "Concise reasoning grounded ONLY in the provided macro data and price "
+        "action. No news, events, earnings, or headlines."
+        if macro else
+        "Concise reasoning grounded ONLY in the provided price action. "
+        "No macro, rates, inflation, or news."
+    )
+    return {
+        "name": "submit_forecast",
+        "description": "Record your calibrated probability and reasoning for the claim.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "probability": {
+                    "type": "number",
+                    "description": "Your P(claim is TRUE), a number between 0 and 1.",
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": reason_desc,
+                },
             },
-            "reasoning": {
-                "type": "string",
-                "description": (
-                    "Concise reasoning grounded ONLY in the provided price action. "
-                    "No macro, rates, inflation, or news."
-                ),
-            },
+            "required": ["probability", "reasoning"],
         },
-        "required": ["probability", "reasoning"],
-    },
-}
+    }
+
+
+# Kept for back-compat with any caller that wants the base tool directly.
+_TOOL = _build_tool()
 
 
 @dataclass
@@ -109,15 +169,18 @@ def build_user_prompt(
     anchor_close: float,
     resolves_on: date,
     price_context: str,
+    macro_context: str | None = None,
 ) -> str:
+    macro_block = f"\n\n{macro_context}" if macro_context else ""
+    evidence = "price action and macro data" if macro_context else "price action"
     return (
         f"CLAIM TO FORECAST ({ticker}):\n"
         f'"{claim}"\n\n'
         f"Horizon: {horizon_days} trading sessions. Anchor session: "
         f"{anchor_date.isoformat()} (anchor close {anchor_close:.2f}). The claim "
         f"resolves on {resolves_on.isoformat()} using that day's closing price.\n\n"
-        f"{price_context}\n\n"
-        "Reason only from the price action above, then call submit_forecast with "
+        f"{price_context}{macro_block}\n\n"
+        f"Reason only from the {evidence} above, then call submit_forecast with "
         "your probability that the claim is TRUE."
     )
 
@@ -134,12 +197,19 @@ def forecast(
     client=None,
     model: str | None = None,
     lessons: str | None = None,
+    macro_context: str | None = None,
 ) -> ForecastResult:
-    """Produce a calibrated forecast for `claim` from price history alone.
+    """Produce a calibrated forecast for `claim` from price history.
 
     ``lessons`` (the coached arm) appends the distilled self-review lessons to
-    the system prompt — this is the only difference between the ``pythia`` and
+    the system prompt — the only difference between the ``pythia`` and
     ``pythia_coached`` arms, so the coaching effect is cleanly measurable.
+
+    ``macro_context`` (the v1 macro arm) switches to the macro system prompt
+    and appends the point-in-time macro block to the user prompt — the only
+    difference between ``pythia`` and ``pythia_macro``, so the macro effect is
+    cleanly measurable. The two are independent; the cli runs them as separate
+    arms and never combines them (an unmeasured combo would muddy the A/B).
     """
     model = model or config.MODEL_FORECAST
     if client is None:
@@ -147,6 +217,7 @@ def forecast(
 
         client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
 
+    is_macro = macro_context is not None
     user_prompt = build_user_prompt(
         ticker=ticker,
         claim=claim,
@@ -155,9 +226,10 @@ def forecast(
         anchor_close=anchor_close,
         resolves_on=resolves_on,
         price_context=data.format_price_context(history),
+        macro_context=macro_context,
     )
 
-    system = build_system_prompt(config.asset_class(ticker))
+    system = build_system_prompt(config.asset_class(ticker), macro=is_macro)
     if lessons:
         system += (
             "\n\nLESSONS FROM YOUR OWN GRADED RECORD — apply them to this "
@@ -168,7 +240,7 @@ def forecast(
         model=model,
         max_tokens=1024,
         system=system,
-        tools=[_TOOL],
+        tools=[_build_tool(macro=is_macro)],
         tool_choice={"type": "tool", "name": "submit_forecast"},
         messages=[{"role": "user", "content": user_prompt}],
     )

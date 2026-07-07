@@ -9,7 +9,7 @@ stands and why. Sibling project:*
   **test flight**. Never spend a Pythia-week on something Delphi can reject for
   $0.50; conversely, only Pythia's forward record is evidence that counts.
 
-*Last updated 2026-06-10.*
+*Last updated 2026-06-22.*
 
 ---
 
@@ -33,9 +33,11 @@ is the clean ablation baseline for the later news-reading version).
   rank anything (the first resolved week was a single selloff week ≈ 2-3
   effective data points — claims within a day are correlated). Do not draw
   conclusions from the leaderboard yet; ~month 3 is the first honest read.
-- **Nine forecaster columns on every claim** (identities in `config.py`):
+- **Ten forecaster columns on every claim** (identities in `config.py`):
   - `pythia` — raw Opus, the permanent control arm.
   - `pythia_coached` — Opus + distilled lessons (NEW, off until first reflect).
+  - `pythia_macro` — Opus + point-in-time FRED macro (NEW v1, §11; live-only,
+    on when `FRED_API_KEY` is set).
   - `pythia_iso` — isotonic remap of raw (NEW, auto-on at 150 resolved).
   - `pythia_coached_iso` — the full stack (NEW, needs 150 resolved coached).
   - `coin_flip`, `drift`, `naive_momentum` — the floor ladder.
@@ -129,9 +131,9 @@ uv run pytest             # 92 offline tests (scoring/calendar/kalshi/calibrate/
 - **month 6+**: IF gates pass — manual, small, human-placed positions on
   surfaced high-conviction calls only (the wall stays).
 - **v1+ (build next)**: FRED macro as a measured A/B against the price-only
-  arms; later the news-reading phase (the LLM's only plausible edge over a
-  price model — testable only on post-cutoff data; Polymarket belongs here,
-  not before).
+  arms — DONE 2026-06-22, see §11 (`pythia_macro`); later the news-reading
+  phase (the LLM's only plausible remaining edge over a price model —
+  testable only on post-cutoff data; Polymarket belongs here, not before).
 
 ## 8. Known limitations
 
@@ -241,3 +243,72 @@ numbers in `audit_em_convergence.json`):
 - Tests 110 → 113 (em-token round-trip + legacy default; em_iters provably
   reaches the fit; legacy reconstruction reproduces the truncated fit
   exactly).
+
+## 11. COMPLETED 2026-06-22 — v1 macro arm (`pythia_macro`, FRED point-in-time)
+
+The roadmap's "v1+ (build next): FRED macro as a measured A/B against the
+price-only arms" is done. A tenth forecaster column, `pythia_macro`, runs
+alongside raw `pythia` on every claim: identical ticker, identical price data,
+identical horizon, identical anchor — the ONLY difference is a point-in-time
+macro block in the prompt and a system prompt that lifts the v0 price-only
+restriction for that arm alone. Raw `pythia` stays price-only forever, so the
+macro effect is MEASURED on identical claims for the life of the project (same
+design discipline as the coached arm, §4).
+
+- **Six daily, market-implied FRED series** (`config.FRED_SERIES`): DGS10, DGS2
+  (rates — and the 2s10s slope is DERIVED in the formatter from those two, not
+  fetched, so it can't mismatch its own yields on vintage), T10YIE (breakeven
+  inflation), BAMLH0A0HYM2 (HY credit spread), VIXCLS, DTWEXBGS (trade-weighted
+  dollar). Chosen because all actually MOVE within a 5-session horizon (monthly
+  macro is largely stale within the window) and all are exactly what the v0
+  prompt forbids — so v1 lifts that ban for one arm and measures whether it
+  helps calibration. The context block shows each series' latest value plus the
+  value 5 and 20 sessions back (parallel to the price context's 5d/20d returns)
+  and the change in native units.
+- **Point-in-time via FRED's realtime API** (`macro.py`): every series fetched
+  with `realtime_start=realtime_end=anchor_date` AND `observation_start/end`
+  spanning the lookback, so each returned observation is the value KNOWN on the
+  anchor day (its real-time period includes the anchor), not today's revised
+  value. A backfilled anchor therefore sees the macro the forecaster actually
+  had — no future-revision leakage. For these daily market-implied series
+  revisions are near-nil anyway, but the realtime call is free and is the
+  method-faithful choice. Unit-tested (`test_macro.py` pins both realtime params
+  to the anchor date).
+- **Audit trail**: one `macro_snapshots` row per anchor_date (macro is per-date,
+  shared across all 30 tickers — the first ticker on a run pays the FRED fetch,
+  the rest reuse it from the cache or DB). The series payload is content-hashed
+  (`context_sha`) and the macro arm's `model` column carries `+macro:<sha>`, so
+  any slice of the record ties to the exact macro data the arm saw — same
+  pattern as the lessons sha (§4). First-write-wins like forecasts/hmm_fits;
+  the vintage for a given anchor date never changes.
+- **No `backfill-macro` command — deliberate.** Unlike `backfill-hmm` (a pure
+  statistical model, clean to reconstruct point-in-time), the macro arm is an
+  LLM call: backfilling would ask Opus *today* to forecast an old, possibly-
+  resolved claim, risking training-cutoff leakage of the outcome. The macro arm
+  is LIVE-ONLY, like raw `pythia` and `kalshi` — the A/B accumulates going
+  forward, consistent with "logs before the outcome is known."
+- **Optional + best-effort** (like email alerts): needs `FRED_API_KEY` in
+  `.env`; when unset the macro arm is a clean no-op and the price-only arms run
+  unaffected. A dead/missing series renders as n/a; if NO series returns
+  usable data the arm skips that day (a missing row beats a fudged one — same
+  rule as Kalshi).
+- **No iso/coached-macro variants yet.** Base arm first, measured clean. A
+  `pythia_macro_iso` can follow once the macro arm clears `ISO_MIN_RESOLVED`
+  (150) — the calibrators are intentionally fitted on the base arms' own
+  records only, and macro must not leak into the raw/coached iso fits.
+- **Cost**: +1 Opus call per ticker per day. 30→60 with macro on (coached still
+  off until first reflect); 30→90 once both macro and coached run. Within the
+  "cost is trivial at 30-60 calls/day" line the project set — 90 is the upper
+  bound it anticipated.
+- Tests 113 → 137 (+24: formatter incl. the derived slope and missing-series
+  handling, sha determinism + order-independence, FRED realtime point-in-time
+  params, missing-value skipping, snapshot orchestration with a dead series,
+  DB round-trip + idempotency + fresh-DB migration, forecaster prompt/tool
+  variants).
+
+The deploy question this arm answers, in order: does real point-in-time macro
+beat the price-only arms (`pythia`, `hmm_filter`) on calibration? Delphi's
+finding (§3.4) was that the correction layers, not the model, carry most of the
+value — macro is the LLM's one plausible edge over a pure price model, and the
+only honest way to test it is on claims logged before the outcome, which is now
+running.

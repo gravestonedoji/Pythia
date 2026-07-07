@@ -31,7 +31,7 @@ from rich.table import Table
 
 from . import (
     baselines, calibrate, config, data, forecaster, hmm_baseline, hmm_health,
-    kalshi, reflect, scoring, storage,
+    kalshi, macro, reflect, scoring, storage,
 )
 from . import notify as notifier  # aliased: the `notify` command below would shadow it
 from .storage import Forecast
@@ -49,6 +49,34 @@ def build_claim(ticker: str, anchor_date: date, anchor_close: float, resolves_on
         f"{ticker} closing price on {resolves_on.isoformat()} will be greater than or "
         f"equal to its {anchor_date.isoformat()} close of {anchor_close:.2f}."
     )
+
+
+def _macro_snapshot_for(
+    anchor_date_iso: str, cache: dict, conn
+) -> "macro.MacroSnapshot | None":
+    """Get the point-in-time macro snapshot for one anchor date, fetching once.
+
+    Macro is per-date (shared across every ticker anchored that day), so the
+    first ticker on a run pays the FRED fetch and persists the snapshot; the
+    rest reuse it from the cache (or the DB on a later run). Returns None when
+    FRED is unconfigured or returned nothing usable — the macro arm then no-ops.
+    """
+    if anchor_date_iso in cache:
+        return cache[anchor_date_iso]
+    snap = None
+    row = storage.fetch_macro_snapshot(conn, anchor_date_iso)
+    if row is not None:
+        snap = macro.snapshot_from_row(row)
+    else:
+        try:
+            snap = macro.get_macro_snapshot(date.fromisoformat(anchor_date_iso))
+        except Exception as exc:  # noqa: BLE001 - FRED down shouldn't kill the run
+            console.print(f"  [yellow]macro fetch failed: {exc}[/yellow]")
+            snap = None
+        if snap is not None:
+            storage.insert_macro_snapshot(conn, snap)
+    cache[anchor_date_iso] = snap
+    return snap
 
 
 def _fmt_pct(x: Optional[float]) -> str:
@@ -105,6 +133,19 @@ def forecast(
         for base in (config.PYTHIA, config.PYTHIA_COACHED)
     }
 
+    # v1 macro arm: identical claim + price data plus a point-in-time FRED
+    # macro block. The ONLY difference from raw pythia, so the macro effect is
+    # measured on identical claims. No-ops cleanly when FRED_API_KEY is unset
+    # (price-only arms unaffected). The snapshot is per-anchor-date and shared
+    # across tickers; fetched once, persisted for audit.
+    macro_enabled = config.fred_api_key() is not None
+    macro_cache: dict[str, object] = {}
+    if macro_enabled:
+        console.print("[dim]macro arm on (FRED point-in-time)[/dim]")
+    else:
+        console.print("[dim]FRED_API_KEY not set - pythia_macro arm off "
+                      "(price-only arms unaffected).[/dim]")
+
     issued = 0
     skipped = 0
     for tk in tickers:
@@ -153,6 +194,29 @@ def forecast(
                     probability=cres.probability, reasoning=cres.reasoning,
                     model=f"{cres.model}+lessons:{lessons[1]}",
                 ))
+            # Macro arm (v1): same claim, same price data, plus a point-in-time
+            # FRED macro block in the prompt and the macro system prompt that
+            # lifts the price-only restriction. The ONLY difference from raw
+            # pythia, so the macro effect is measured on identical claims. The
+            # macro sha is recorded in `model` so any record slice ties to the
+            # exact macro data the arm saw.
+            if macro_enabled:
+                snap = _macro_snapshot_for(anchor_date.isoformat(), macro_cache, conn)
+                if snap is not None:
+                    mres = forecaster.forecast(
+                        tk, history,
+                        claim=claim, horizon_days=horizon,
+                        anchor_date=anchor_date, anchor_close=anchor_close,
+                        resolves_on=resolves_on, client=client,
+                        macro_context=macro.format_macro_context(snap),
+                    )
+                    rows.append(Forecast(
+                        forecaster=config.PYTHIA_MACRO, ticker=tk, claim=claim,
+                        horizon_days=horizon, anchor_date=anchor_date.isoformat(),
+                        anchor_close=anchor_close, resolves_on=resolves_on.isoformat(),
+                        probability=mres.probability, reasoning=mres.reasoning,
+                        model=f"{mres.model}+macro:{snap.context_sha}",
+                    ))
             # Derived isotonic arms: free (no model call), strictly point-in-time
             # remaps of the base arms' probabilities. Skipped until the base
             # arm's resolved record clears ISO_MIN_RESOLVED.

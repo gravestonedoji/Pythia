@@ -187,6 +187,58 @@ KALSHI_MAX_SPREAD = 0.10
 # Polite gap between unauthenticated API calls (the public limit trips easily).
 KALSHI_THROTTLE_S = 1.0
 
+# --- FRED macro context (v1: the macro-aware arm) ------------------------------
+# Read-only public FRED API; needs FRED_API_KEY in .env (free key from
+# https://fred.stlouisfed.org/docs/api/api_key.html). When unset, the
+# pythia_macro arm is a clean no-op — the price-only arms run unaffected, just
+# like email alerts without SMTP. Macro is fed ONLY to pythia_macro, never to
+# the raw/coached arms, so the v0 price-only ablation stays clean and the macro
+# effect is measured on IDENTICAL claims (same anchor, same price data, same
+# horizon; the only difference is the macro block in the prompt).
+#
+# Point-in-time is the whole point of v1. Every series is fetched via FRED's
+# realtime API (realtime_start=realtime_end=anchor_date) so the arm sees the
+# values KNOWN on the anchor day, not today's revisions. Without this, a
+# backfilled anchor would leak revised macro the forecaster never saw, and the
+# A/B against price-only would be dishonest. For these daily market-implied
+# series revisions are near-nil anyway, but the realtime call is free and is the
+# methodologically faithful choice (and it future-proofs any monthly series).
+FRED_API_BASE = "https://api.stlouisfed.org/fred/series/observations"
+FRED_LOOKBACK_DAYS = 90          # calendar days of history to fetch (5d/20d change context)
+FRED_THROTTLE_S = 0.2            # polite gap (free tier allows 120 req/min)
+
+
+@dataclass(frozen=True)
+class FredSeries:
+    series_id: str
+    label: str   # human label rendered in the macro context block
+    unit: str    # "%" for yields/spreads; "" for index points / VIX
+    fmt: str     # format spec for the value, e.g. ".2f"
+
+
+# Six daily, market-implied series — all actually MOVE within a 5-session
+# horizon (unlike monthly macro, which is stale within the window), and all are
+# read point-in-time via the realtime API. Covers rates (2y/10y), the curve
+# (the 2s10s slope is DERIVED in the formatter, not fetched), inflation
+# expectations (10y breakeven), credit stress (HY spread), risk appetite (VIX),
+# and the dollar. These are exactly the "rates, inflation, the Fed, the yield
+# curve" the v0 price-only prompt forbids — v1 lifts that ban for the macro arm
+# only and MEASURES whether it helps calibration.
+FRED_SERIES: tuple[FredSeries, ...] = (
+    FredSeries("DGS10", "10y Treasury yield", "%", ".2f"),
+    FredSeries("DGS2", "2y Treasury yield", "%", ".2f"),
+    FredSeries("T10YIE", "10y breakeven inflation", "%", ".2f"),
+    FredSeries("BAMLH0A0HYM2", "HY credit spread", "%", ".2f"),
+    FredSeries("VIXCLS", "VIX", "", ".1f"),
+    FredSeries("DTWEXBGS", "Trade-weighted dollar", "", ".2f"),
+)
+
+
+def fred_api_key() -> str | None:
+    """FRED API key from the env, or None when the macro arm should no-op."""
+    key = os.environ.get("FRED_API_KEY", "").strip()
+    return key or None
+
 # --- Market / calendar -------------------------------------------------------
 # NYSE calendar covers SPY/QQQ/IWM (US equity ETFs).
 EXCHANGE = "XNYS"
@@ -205,18 +257,21 @@ BASELINES: list[str] = ["coin_flip", "drift", "naive_momentum", HMM_FILTER, KALS
 # claims so every layer stays measured, never assumed:
 #   pythia             raw Opus — the permanent control arm
 #   pythia_coached     Opus + distilled lessons in the prompt (reflect.py)
+#   pythia_macro       Opus + real point-in-time macro (FRED) — the v1 A/B arm
 #   pythia_iso         isotonic remap of pythia's raw probability (calibrate.py)
 #   pythia_coached_iso isotonic remap of the coached probability (full stack)
 PYTHIA_COACHED = "pythia_coached"
+PYTHIA_MACRO = "pythia_macro"
 PYTHIA_ISO = "pythia_iso"
 PYTHIA_COACHED_ISO = "pythia_coached_iso"
-PYTHIA_ARMS: list[str] = [PYTHIA, PYTHIA_COACHED, PYTHIA_ISO, PYTHIA_COACHED_ISO]
+PYTHIA_ARMS: list[str] = [PYTHIA, PYTHIA_COACHED, PYTHIA_MACRO, PYTHIA_ISO, PYTHIA_COACHED_ISO]
 ALL_FORECASTERS: list[str] = [*PYTHIA_ARMS, *BASELINES]
 
 # Human-friendly labels for review output.
 FORECASTER_LABELS: dict[str, str] = {
     "pythia": "Pythia (raw)",
     "pythia_coached": "Pythia + lessons",
+    "pythia_macro": "Pythia + macro",
     "pythia_iso": "Pythia + isotonic",
     "pythia_coached_iso": "Pythia + lessons + isotonic",
     "coin_flip": "Coin flip",
