@@ -1,6 +1,6 @@
 [project]
 name = "pythia"
-version = "0.1.0"
+version = "0.4.0"
 description = "Pythia — a self-grading market forecaster: forms falsifiable, time-boxed ETF predictions, logs them before the outcome is known, and grades itself against real prices."
 readme = "README.md"
 requires-python = ">=3.12"
