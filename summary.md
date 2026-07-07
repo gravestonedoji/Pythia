@@ -120,7 +120,7 @@ uv run pythia paper-trade # same-evening retry of the paper capture (v2)
 uv run pythia alerts      # the high-conviction alert log + its scoreboard (v3)
 uv run pythia publish     # render the dashboard to docs/ (v4, local-only)
 uv run pythia backfill-hmm
-uv run pytest             # 218 offline tests (no network, no key)
+uv run pytest             # 226 offline tests (no network, no key)
 ```
 
 ## 7. Roadmap and gates (gated, not scheduled)
@@ -445,3 +445,45 @@ auditable).
   dies). The DB stays local/gitignored.
 - The paper book and alert record both started 2026-07-07 — every day they
   run is record; gaps are permanent (no backfill anywhere).
+
+## 16. COMPLETED 2026-07-07 — adversarial review of the v2/v3/v4 build (18 confirmed fixes)
+
+The whole session diff went through a two-pass multi-agent review (five
+dimension-focused reviewers; every finding then adversarially verified against
+the committed code, refute-by-default). 18 findings survived verification and
+were fixed the same day; the notable ones changed real behavior:
+
+- **`resolve`/paper settlement never grade an uncompleted session** (the
+  biggest catch, and it applied to the PRE-EXISTING `scoring.resolve_due` too,
+  not just the new paper book): during market hours Yahoo serves the
+  in-progress bar as today's "close", and a resolved/settled row is permanent
+  — an intraday `pythia resolve` would have frozen a live 1pm price into the
+  record. The due cutoff now clamps to the last completed session; a claim or
+  position maturing today grades on the first run after the bell. OPS NOTE:
+  running `resolve` intraday is now safe and simply defers today's rows.
+- **The entry window gates paper POSITIONS, not just quote capture** — a
+  logged usable pair can no longer be turned into positions after the next
+  session opens (a late run that already glimpsed the outcome could otherwise
+  have chosen which claims to "enter"). Quote-pair inserts are also atomic
+  (a crash between the two commits could half-log a book and permanently lock
+  the claim out).
+- **Digest delivery honesty**: `pythia notify` re-sends now set `emailed_at`
+  on the logged alerts they deliver (it was a permanent false 'no' after
+  `--no-notify` + `notify`); an all-duplicate `forecast` re-run with unmailed
+  alerts rebuilds and retries the batch email; `emailed_at` is only stamped
+  when the digest actually rode the email; re-sends keep the repeat_of
+  correlation caveat and attribute the lead reasoning to the arm whose p the
+  alert stored; flag lines show each flagged arm's OWN probability (two arms
+  can cross the threshold in opposite directions).
+- **The macro and coached arms are exception-isolated** like hmm/kalshi — an
+  API error on a derived arm no longer discards the ticker's already-computed
+  raw forecast.
+- Smaller: `pnl --min-edge` filters on |p−0.5| as documented (was 2|p−0.5|);
+  `content_sha` no longer embeds the embargo banner's day-count (it changed
+  the sha every calendar day, defeating unchanged-skip for the whole 90-day
+  embargo); publish change-detection is scoped per output path and the page
+  declares utf-8 (file:// defaulted to cp1252 → mojibake); pd.NaT no longer
+  leaks the literal string 'NaT' into the quote audit trail.
+
+Tests 218 → 226. Full finding-by-finding detail is in the commit messages of
+5f193fa and afc5bc3.
