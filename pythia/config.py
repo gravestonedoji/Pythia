@@ -23,6 +23,31 @@ MODEL_FORECAST = "claude-opus-4-8"   # the daily forecast (the brain)
 MODEL_REVIEW = "claude-opus-4-8"     # weekly self-review (v1+), highest-leverage reasoning
 MODEL_TRIAGE = "claude-haiku-4-5"    # high-volume extraction/tagging (v1+), cheap and fast
 
+# --- Model transport -----------------------------------------------------------
+# How the daily forecast reaches the model. SAME model either way; only the
+# auth/billing path differs, and every row stamps the path it used
+# (`+via:claude-code`) so record slices stay attributable across the changeover
+# (hmm `em` token precedent).
+#   "api"          — Anthropic SDK with ANTHROPIC_API_KEY (metered billing).
+#   "subscription" — headless `claude -p` through the local Claude Code login,
+#                    billed to the user's plan instead of per token. The
+#                    subprocess runs with the API key STRIPPED from its env
+#                    (else the CLI would silently bill the key), no tools, no
+#                    settings sources, and a neutral cwd (no CLAUDE.md leaks
+#                    into the subject's prompt). NOTE: shares the plan's
+#                    session limits with interactive use — a maxed-out window
+#                    means arms skip that day (missing rows, honestly).
+# The weekly `reflect` (4 calls/month, pennies) stays on the API key.
+def transport() -> str:
+    """The forecast transport from the env: 'api' (default) or 'subscription'."""
+    t = os.environ.get("PYTHIA_TRANSPORT", "").strip().lower()
+    return t if t in ("api", "subscription") else "api"
+
+
+# The Claude Code executable; override with PYTHIA_CLAUDE_CLI if not on PATH.
+def claude_cli() -> str:
+    return os.environ.get("PYTHIA_CLAUDE_CLI", "").strip() or "claude"
+
 # --- Watchlist ---------------------------------------------------------------
 # Broad-based / liquid ETFs only. No single stocks, no single-stock ETFs.
 # Deliberately spread across distinct return drivers so the track record isn't

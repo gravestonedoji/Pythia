@@ -31,7 +31,9 @@ built so each added data layer can be *measured* against the simpler one.
    "forecast/grade" (automated) and "execute real money" (human-only). Do not
    add any live-broker order placement.
 3. **Secrets in `.env`, never committed.** `ANTHROPIC_API_KEY` is the only
-   *required* secret. Optional email alerts add SMTP credentials
+   *required* secret (with `PYTHIA_TRANSPORT=subscription` the daily forecast
+   instead rides the local Claude Code login — see summary.md §17 — and the
+   key is only used by `reflect`). Optional email alerts add SMTP credentials
    (`PYTHIA_SMTP_*` / `PYTHIA_EMAIL_*`) — also `.env`-only, and a clean no-op
    when unset. `.env` and `*.db` are gitignored.
 
@@ -83,6 +85,9 @@ built so each added data layer can be *measured* against the simpler one.
   point and it runs once per ticker per day, so cost is trivial. Do not downgrade.
 - **Weekly self-review (v1+):** `claude-opus-4-8`.
 - **Data/news triage, extraction, tagging (v1+):** `claude-haiku-4-5`.
+- **Transport:** forecasts reach the model via the metered API by default, or
+  the Claude Code subscription login when `PYTHIA_TRANSPORT=subscription`
+  (rows stamped `+via:claude-code`; same model either way).
 
 ## Run commands
 

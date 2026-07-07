@@ -487,3 +487,36 @@ were fixed the same day; the notable ones changed real behavior:
 
 Tests 218 → 226. Full finding-by-finding detail is in the commit messages of
 5f193fa and afc5bc3.
+
+## 17. COMPLETED 2026-07-07 — subscription transport (`PYTHIA_TRANSPORT=subscription`)
+
+The daily forecast now rides the user's Claude Code subscription login
+(headless `claude -p`) instead of the metered API key — the SAME
+`claude-opus-4-8`, the SAME system and user prompts, only the auth/billing
+path differs. Cost: ~$35/month of metered Opus -> $0 marginal. Chosen over a
+model swap after pricing the alternatives: Fable 5 would run 3-6x the cost
+for no measurable calibration gain on this task (Delphi: correction layers,
+not the model, carry the value), and a cheaper third-party model would break
+subject continuity to save ~$25/month.
+
+- **Changeover is stamped, not silent**: every row logged through the new
+  path carries `+via:claude-code` in its model descriptor (the hmm `em` /
+  `+lessons:` / `+macro:` convention), so record slices remain attributable
+  across the boundary. The API transport forced a structured tool call; the
+  subscription transport instructs strict JSON and REFUSES (raises) when the
+  output doesn't parse — a missing row beats a fudged one.
+- **Isolation** (`forecaster.forecast_via_subscription`): the subprocess runs
+  with `--tools ""`, `--setting-sources ""` (no CLAUDE.md or settings can
+  leak into the subject's prompt), `--no-session-persistence`, a neutral cwd,
+  and with `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` STRIPPED from its env —
+  with a key present the CLI would silently bill the API and the transport
+  would be pointless.
+- **Ops caveats**: forecasts now share the plan's session limits with
+  interactive Claude Code use — a maxed-out window means arms skip that day
+  (honest missing rows; re-run `pythia forecast` later in the day, idempotent
+  first-write-wins makes that safe). The weekly `reflect` still uses the API
+  key (4 calls/month — pennies). Fall back any time by blanking
+  PYTHIA_TRANSPORT in .env; rows go back to unstamped API calls.
+- Tests 226 -> 238 (argv/env isolation incl. the key-strip, JSON parse +
+  clamp + refuse-on-garbage, transport stamp, CLI-failure surfacing; live
+  smoke test passed 2026-07-07: Opus served via the login, stamp verified).

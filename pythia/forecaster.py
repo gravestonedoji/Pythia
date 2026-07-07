@@ -19,8 +19,15 @@ identical claims for the life of the project.
 
 from __future__ import annotations
 
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import date
+from typing import Callable
 
 import pandas as pd
 
@@ -212,10 +219,6 @@ def forecast(
     arms and never combines them (an unmeasured combo would muddy the A/B).
     """
     model = model or config.MODEL_FORECAST
-    if client is None:
-        import anthropic
-
-        client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
 
     is_macro = macro_context is not None
     user_prompt = build_user_prompt(
@@ -235,6 +238,16 @@ def forecast(
             "\n\nLESSONS FROM YOUR OWN GRADED RECORD — apply them to this "
             f"forecast:\n{lessons}"
         )
+
+    # Subscription transport: same model, same prompts, different auth path —
+    # stamped on the row so record slices stay attributable (see config.py).
+    if config.transport() == "subscription":
+        return forecast_via_subscription(system, user_prompt, model=model)
+
+    if client is None:
+        import anthropic
+
+        client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
 
     response = client.messages.create(
         model=model,
@@ -257,3 +270,107 @@ def _extract_tool_input(response) -> dict:
         if getattr(block, "type", None) == "tool_use" and block.name == "submit_forecast":
             return block.input
     raise RuntimeError("Model did not return a submit_forecast tool call")
+
+
+# --- Subscription transport (headless Claude Code) -------------------------------
+# `claude -p` through the user's Claude Code login: the SAME model receives the
+# SAME system + user prompts, billed to the plan instead of per token. The API
+# transport forces a tool call for structure; the CLI has no tool_choice, so
+# this path instructs strict JSON and parses it — refuse (raise) rather than
+# fudge when the output doesn't parse. Isolation matters more than usual here:
+# no tools, no settings sources (a CLAUDE.md leaking into the subject's prompt
+# would silently change the experiment), a neutral cwd, and the metered API key
+# stripped from the subprocess env (else the CLI would quietly bill it and the
+# whole point of the transport is lost).
+
+_TRANSPORT_TAG = "+via:claude-code"
+
+_JSON_INSTRUCTION = (
+    "\n\nOutput format: respond with ONLY a JSON object and no other text, "
+    'exactly: {"probability": <number between 0 and 1>, '
+    '"reasoning": "<a few concise sentences>"}'
+)
+
+# Injectable runner for offline tests: (cmd, env, cwd) -> completed-process-like.
+CliRunner = Callable[[list, dict, str], "subprocess.CompletedProcess"]
+
+
+def _subscription_cmd(system: str, user_prompt: str, model: str) -> list:
+    """The exact argv for one headless forecast call (pure; unit-tested)."""
+    cli = shutil.which(config.claude_cli())
+    if cli is None:
+        raise RuntimeError(
+            f"Claude Code CLI {config.claude_cli()!r} not found on PATH "
+            "(PYTHIA_TRANSPORT=subscription needs it; set PYTHIA_CLAUDE_CLI "
+            "to its full path, or switch back to the api transport)")
+    head = ["cmd", "/c", cli] if cli.lower().endswith((".cmd", ".bat")) else [cli]
+    return [
+        *head, "-p",
+        "--model", model,
+        "--output-format", "json",
+        "--system-prompt", system,
+        "--tools", "",              # the forecast is a pure text-in/text-out call
+        "--setting-sources", "",    # no user/project settings, no CLAUDE.md leakage
+        "--no-session-persistence",
+        user_prompt + _JSON_INSTRUCTION,
+    ]
+
+
+def _subscription_env() -> dict:
+    """Subprocess env with metered credentials stripped (pure; unit-tested).
+
+    With a key present the CLI would silently bill the API instead of the
+    subscription; stripping it makes the CLI fall back to the stored login.
+    """
+    env = dict(os.environ)
+    env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    return env
+
+
+def parse_forecast_json(text: str) -> tuple[float, str]:
+    """Parse {"probability", "reasoning"} out of model text (pure; unit-tested).
+
+    Accepts surrounding prose/code fences by falling back to the first JSON
+    object in the text; raises (never guesses) when nothing valid parses.
+    """
+    candidates = [text]
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        candidates.append(m.group(0))
+    for c in candidates:
+        try:
+            payload = json.loads(c)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(payload, dict) and "probability" in payload and "reasoning" in payload:
+            return (_clamp_probability(float(payload["probability"])),
+                    str(payload["reasoning"]).strip())
+    raise RuntimeError(f"model output is not the required JSON: {text[:200]!r}")
+
+
+def forecast_via_subscription(
+    system: str, user_prompt: str, *, model: str, run: CliRunner | None = None
+) -> ForecastResult:
+    """One forecast through the Claude Code login (headless print mode)."""
+    cmd = _subscription_cmd(system, user_prompt, model)
+
+    def _default_run(argv, env, cwd):
+        return subprocess.run(argv, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              timeout=300, env=env, cwd=cwd)
+
+    run = run or _default_run
+    # Neutral cwd: `claude` must not pick up any project's context.
+    proc = run(cmd, _subscription_env(), tempfile.gettempdir())
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"claude -p exited {proc.returncode}: "
+            f"{(proc.stderr or proc.stdout or '').strip()[:300]}")
+    envelope = json.loads(proc.stdout)
+    if envelope.get("is_error"):
+        raise RuntimeError(f"claude -p returned an error: "
+                           f"{str(envelope.get('result'))[:300]}")
+    probability, reasoning = parse_forecast_json(str(envelope.get("result", "")))
+    return ForecastResult(probability=probability, reasoning=reasoning,
+                          model=f"{model}{_TRANSPORT_TAG}")

@@ -187,16 +187,24 @@ def forecast(
     notifications: list[notifier.Prediction] = []
     batch_keys: list[tuple[str, str, int]] = []  # (ticker, anchor, horizon) logged this run
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        console.print(
-            "[red]ANTHROPIC_API_KEY is not set.[/red] Copy .env.example to .env and add "
-            "your key (the forecast step needs it to call the model)."
-        )
-        raise typer.Exit(code=1)
+    if config.transport() == "subscription":
+        # Headless Claude Code login carries the calls; no metered key needed
+        # (forecaster.py strips it from the subprocess env either way).
+        console.print("[dim]transport: subscription (claude -p via the local "
+                      "Claude Code login; rows stamped +via:claude-code)[/dim]")
+        client = None
+    else:
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            console.print(
+                "[red]ANTHROPIC_API_KEY is not set.[/red] Copy .env.example to .env and add "
+                "your key (the forecast step needs it to call the model), or set "
+                "PYTHIA_TRANSPORT=subscription to use the Claude Code login instead."
+            )
+            raise typer.Exit(code=1)
 
-    import anthropic
+        import anthropic
 
-    client = anthropic.Anthropic()
+        client = anthropic.Anthropic()
     conn = storage.get_connection()
 
     # The correction stack, loaded once per run (point-in-time by construction):
