@@ -9,7 +9,7 @@ stands and why. Sibling project:*
   **test flight**. Never spend a Pythia-week on something Delphi can reject for
   $0.50; conversely, only Pythia's forward record is evidence that counts.
 
-*Last updated 2026-06-22.*
+*Last updated 2026-07-07.*
 
 ---
 
@@ -110,13 +110,17 @@ are the reason Pythia's architecture looks the way it does:
 ## 6. Run commands
 
 ```
-uv run pythia forecast    # daily: all arms + baselines, one claim per ticker
-uv run pythia resolve     # settle matured claims against real closes
+uv run pythia forecast    # daily: all arms + baselines + paper book + digest
+uv run pythia resolve     # settle matured claims + expired paper positions
 uv run pythia reflect     # weekly self-review -> lessons.txt (coached arm on)
 uv run pythia review      # leaderboard + call log
 uv run pythia why         # Pythia's reasoning per call
+uv run pythia pnl         # the simulated-options P&L ladder (v2, read-time views)
+uv run pythia paper-trade # same-evening retry of the paper capture (v2)
+uv run pythia alerts      # the high-conviction alert log + its scoreboard (v3)
+uv run pythia publish     # render the dashboard to docs/ (v4, local-only)
 uv run pythia backfill-hmm
-uv run pytest             # 92 offline tests (scoring/calendar/kalshi/calibrate/reflect)
+uv run pytest             # 218 offline tests (no network, no key)
 ```
 
 ## 7. Roadmap and gates (gated, not scheduled)
@@ -134,6 +138,14 @@ uv run pytest             # 92 offline tests (scoring/calendar/kalshi/calibrate/
   arms — DONE 2026-06-22, see §11 (`pythia_macro`); later the news-reading
   phase (the LLM's only plausible remaining edge over a price model —
   testable only on post-cutoff data; Polymarket belongs here, not before).
+- **v2 (simulated options)**: DONE 2026-07-07, see §12 — the paper book
+  accumulates live-only from here.
+- **v3 (digest + alerting)**: DONE 2026-07-07, see §13 — the alert record
+  accumulates live-only from here.
+- **v4 (dashboard)**: BUILT 2026-07-07, see §14 — `pythia publish` is
+  local-only until the go-public owner call is made.
+- **Next**: the news-reading arm (same measured-A/B design as macro), and the
+  month-3 first honest read (~September 2026).
 
 ## 8. Known limitations
 
@@ -312,3 +324,124 @@ finding (§3.4) was that the correction layers, not the model, carry most of the
 value — macro is the LLM's one plausible edge over a pure price model, and the
 only honest way to test it is on claims logged before the outcome, which is now
 running.
+
+## 12. COMPLETED 2026-07-07 — v2: the paper book (`paper.py`/`pnl.py`, simulated options)
+
+The Brier ladder says who is calibrated; the paper book says what that
+calibration would have been *worth* — P&L is exactly where overconfidence
+becomes visible (Delphi: $1 -> $0.025 at full Kelly behind a respectable
+Brier). SIMULATED ONLY; the hard wall stands — no broker, no orders, nothing
+that prepares one.
+
+- **One contract pair per claim** (long ATM call + put, same strike, expiry
+  within ±2 sessions of `resolves_on`, signed gap recorded — the kalshi
+  settle-gap pattern). **Every arm and bar trades the same pair at the same
+  logged quote**; only direction (its own p; exactly 0.5 sits out, which
+  removes coin_flip) and read-time sizing differ, so the P&L ladder mirrors
+  the Brier ladder row for row. Whitelist (conservative, gates are the real
+  filter): SPY QQQ IWM DIA TLT GLD.
+- **Entry honesty**: positions open only from probabilities READ BACK from
+  logged forecast rows (never in-memory results); a time gate (capture before
+  the next session's open) and an underlying-drift gate (≤0.5% off the anchor
+  close) keep post-anchor information out of entries; kalshi-style book gates
+  (two-sided uncrossed, relative-dominant spread cap max($0.05, 15% of mid),
+  premium floor $0.20, OI ≥ 100) refuse-don't-fudge. BOTH sides must pass or
+  nobody trades (a one-sided book would bias bullish vs bearish arms). Every
+  selected book is logged usable-or-not (`option_quotes`, first-write-wins,
+  gates-in-force stamped per row); claim-level refusals log nothing, like an
+  unmatched kalshi claim.
+- **P&L of record = entry at logged mid -> settle at INTRINSIC off the
+  official raw close on expiry** (scoring.py's close). Deliberately NO daily
+  marks — after-hours yfinance books are stale/zero-bid and a mark from one
+  would be unauditable noise; open positions carry at cost. `--worst-fill`
+  re-prices entries at the logged ask (the whole transaction-cost model).
+- **Sizing is a measured READ-TIME ladder** (`pythia pnl`), never stored:
+  fixed $100 / edge-scaled / kelly05 / kelly10 (compounding bankroll replay,
+  deterministic from immutable rows; full Kelly exists precisely so an
+  overconfident arm visibly compounds toward ruin). Changing the policy
+  constants re-renders history — pnl stamps the params in force.
+- **TIMING REALITY (watch week 1): ETF options stop trading 4:15 ET and Yahoo
+  after-hours books are often one-sided/zero-bid — an evening run will log
+  many honest usable=0 days. A usable paper book wants the capture in the
+  ~4:00-4:15 ET window (`pythia paper-trade` is the same-evening retry).**
+  Check the usable-rate after the first week before reading anything into
+  book sizes.
+- Live-only, no backfill (yfinance has no historical chains): the book
+  accumulates forward from 2026-07-07. Tests 137 -> 184.
+
+## 13. COMPLETED 2026-07-07 — v3: high-conviction digest + a gradeable alert record
+
+The missing half of v3 (notify.py already emailed every batch): flag the calls
+worth a human's attention, and make the alert rule itself accountable.
+
+- **Rule**: any live LLM arm (raw/coached/macro) whose own p crosses
+  |P-0.5| >= 0.15 flags the claim. Iso arms excluded (conviction is a remap
+  artifact at this record size — the current PAV fit caps every output below
+  0.5); bars excluded (the HMM's confident calls graded 38.9% hit on the early
+  record — bars grade the product, they don't page the human).
+- **The threshold was chosen POST-HOC** at the visible cliff of the early
+  record (raw >=0.15: 11/12; coached: 6/6; ~1 flagged day/week — vs 60%
+  hit at 0.10-0.15), n≈12 over correlated windows. So every flag is LOGGED
+  (`digest_alerts`, first-write-wins, live-only, threshold AND gate arms in
+  force stamped per row, `emailed_at` = delivery receipt, written even with
+  SMTP unset): the alert log IS the rule's out-of-sample test. **Revisit
+  pre-registered at 30 resolved alerts.** Outcomes never stored — the
+  scoreboard (`pythia alerts`) derives them by joining to `forecasts` (one
+  grading path), per-gating-arm alongside pooled (an OR-gate is three chances
+  per claim).
+- Flags are computed from rows READ BACK from the DB (an alert must never
+  carry a p that matches no logged row). Digest sections prepend the existing
+  batch email — quiet days say so explicitly; the subject gains
+  "N HIGH-CONVICTION |" only on flagged days; overlapping-window repeats are
+  called out inline ("same bet as the YYYY-MM-DD alert, not a new
+  confirmation" — USO once flagged 4 batches running). Re-sends render logged
+  alerts verbatim, never recomputed; pre-feature batches are labeled
+  reconstructed. Wall language in every digest. Deferred: showing the kalshi
+  mid to the human (unresolved anchoring argument), other transports.
+  Tests 184 -> 204.
+
+## 14. COMPLETED 2026-07-07 — v4: the dashboard (`pythia publish`, local-only for now)
+
+`dashboard.py` is pure two-stage generation (rows -> aggregates -> HTML/JSON),
+written to `docs/` as one self-contained page (inline CSS, hand-rolled inline
+SVG, no scripts/CDN — works from file:// and GitHub Pages alike) plus
+`data.json` (the same aggregates, machine-readable — keeps "aggregates only"
+auditable).
+
+- **Aggregates only, never rows**: no claim text, no reasoning, no per-claim
+  probabilities; pending claims appear as COUNTS only (publishing live calls
+  pre-resolution is an owner-level disclosure decision, not taken). Leak-guard
+  tests plant sentinels in rows and assert they never reach the output.
+- **Honesty furniture is first-class content**, rendered from data: the
+  month-3 embargo banner ("do not rank yet", auto-demotes at 90 days), Wilson
+  95% whiskers on equal-count calibration bins (min 25/bin, max 8 bins, NO
+  curve below 100 resolved — "curve appears at N resolved"), the independence
+  caveat on the panels themselves, the HMM taint line (hmm_health verbatim),
+  the kalshi sparse-coverage note, per-section paper-book and alert-rule
+  aggregates, and a research/no-advice/no-live-trading disclaimer strip.
+- **Change detection**: `content_sha` hashes the aggregate payload EXCLUDING
+  the generated-at stamp; unchanged records skip the write (`publishes` audit
+  table). Brier-over-time renders as cumulative running averages (weekly
+  buckets on overlapping claims would be noise).
+- **`pythia publish` NEVER touches git.** OWNER CALL still open: going public
+  needs a public repo (GitHub Pages free tier) — that exposes all code,
+  lessons, and an unretractable public track record (which is also its
+  scientific value). Alternatives: a separate dashboard-only public repo, or
+  keep it local. No publish.bat exists yet ON PURPOSE — an unscheduled .bat
+  that pushes is a loaded gun; write it only after the owner call, with the
+  guards from the design review (abort on staged changes, never pull, never
+  force, nonzero exit + log on push failure, no `pause`, ISO dates).
+  Tests 204 -> 218.
+
+## 15. Ops notes (2026-07-07)
+
+- **Missed forecast day**: no anchors 2026-07-06 (Mon). Fri 7/3 was the
+  July-4 holiday; the machine was likely off Monday. NOT backfilled — the
+  LLM/kalshi/macro columns are live-only by design; the gap is honest. If
+  this recurs, enable "Run task as soon as possible after a scheduled start
+  is missed" on the forecast task in Windows Task Scheduler.
+- `lessons.txt` + `lessons_history.jsonl` are now COMMITTED (the coached
+  rows' `+lessons:<sha>` must stay resolvable to text even if this machine
+  dies). The DB stays local/gitignored.
+- The paper book and alert record both started 2026-07-07 — every day they
+  run is record; gaps are permanent (no backfill anywhere).

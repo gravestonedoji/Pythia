@@ -92,6 +92,9 @@ uv run pythia resolve     # settle matured forecasts against the real close and 
 uv run pythia reflect     # weekly self-review -> lessons.txt (turns the coached arm on)
 uv run pythia review      # print the track record, side by side with the baselines
 uv run pythia notify      # email a forecast batch (re-send the latest, or --test SMTP)
+uv run pythia pnl         # the paper book's P&L ladder (v2; simulated options only)
+uv run pythia alerts      # the high-conviction alert log + scoreboard (v3)
+uv run pythia publish     # render the aggregate dashboard to docs/ (v4; never touches git)
 uv run pytest             # run the offline test suite (no network, no key)
 ```
 
@@ -111,8 +114,12 @@ pythia/
   baselines.py   the reference-forecaster ladder
   scoring.py     resolution + Brier (pure core, unit-tested)
   notify.py      optional email alerts (surfacing-only; SMTP via stdlib)
-  cli.py         typer CLI: forecast / resolve / review / why / notify
-tests/           scoring + calendar + notify tests (offline, no network/key)
+  paper.py       v2: SIMULATED option positions (quote gates, intrinsic settle)
+  pnl.py         v2: the read-time sizing ladder (fixed/edge/kelly replays)
+  digest.py      v3: high-conviction flags + the alert record (pure)
+  dashboard.py   v4: aggregate-only static dashboard (pure HTML/SVG generation)
+  cli.py         typer CLI: forecast / resolve / review / why / notify / pnl / alerts / publish
+tests/           offline test suite (no network, no key)
 ```
 
 ## Roadmap (build v0 first; don't jump ahead)
@@ -121,10 +128,16 @@ tests/           scoring + calendar + notify tests (offline, no network/key)
   isotonic arms — see summary.md §4; the Delphi-validated correction stack,
   every layer measured against the raw arm on identical claims). Still to do:
   FRED macro as a *measured* experiment vs the v0 price-only baseline.
-- **v2** — simulated liquid ETF option positions, marked to market (still
-  simulated only).
-- **v3** — daily digest + alerting (email/Telegram/Discord), flagging only
-  high-conviction calls for manual review. *Started early:* `notify.py` already
-  emails each forecast batch (see `pythia notify`); the high-conviction
-  filtering + digest framing is still to come.
-- **v4** — auto-published dashboard with the live track record + calibration curve.
+- **v2** — simulated liquid ETF option positions: DONE 2026-07-07 (summary.md
+  §12; the paper book — entry at logged after-close mids, settlement at
+  intrinsic off the official close, sizing as read-time views). Simulated
+  only, forever.
+- **v3** — daily digest + alerting: DONE 2026-07-07 (summary.md §13; the
+  high-conviction rule logs its own gradeable record in `digest_alerts` —
+  threshold revisit pre-registered at 30 resolved alerts). Other transports
+  (Telegram/Discord) still open.
+- **v4** — dashboard: BUILT 2026-07-07 (summary.md §14; `pythia publish`
+  renders aggregates only and never touches git). Auto-publishing awaits the
+  go-public owner call (public repo required for GitHub Pages).
+- **Next** — the news-reading arm (the same measured-A/B design as the macro
+  arm; live-only, post-cutoff data), and the month-3 first honest read.
