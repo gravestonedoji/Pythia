@@ -125,14 +125,14 @@ SQLite file (`pythia.db`, gitignored — the dashboard publishes aggregates only
 
 ## Status
 
-| Phase | | |
-|---|---|---|
-| v0 — forecast/resolve/review + baseline ladder | ✅ | live since 2026-06-01 |
-| v1 — self-review (coached arm), isotonic arms, FRED macro arm | ✅ | 2026-06 |
-| v2 — simulated ETF option positions (the paper book) | ✅ | 2026-07 |
-| v3 — high-conviction digest + gradeable alert record | ✅ | 2026-07 |
-| v4 — aggregate dashboard (`pythia publish`) | ✅ | 2026-07 |
-| Next — the news-reading arm; first honest leaderboard read | ⏳ | ~month 3 (2026-09) |
+| Phase | |
+|---|---|
+| v0 — forecast/resolve/review + baseline ladder | ✅ |
+| v1 — self-review (coached arm), isotonic arms, FRED macro arm | ✅ |
+| v2 — simulated ETF option positions (the paper book) | ✅ |
+| v3 — high-conviction digest + gradeable alert record | ✅ |
+| v4 — aggregate dashboard (`pythia publish`) | ✅ |
+| Next — the news-reading arm; the first honest leaderboard read | ⏳ |
 
 The full project journal — design rationale, the wind-tunnel findings that
 shaped the architecture, and per-phase details — is in
