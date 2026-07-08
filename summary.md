@@ -3,9 +3,9 @@
 *The authoritative handoff for Pythia sessions. Read CLAUDE.md for the hard
 contract (what Pythia is and must never do); read this for where the project
 stands and why. Sibling project:*
-- **Delphi** (`C:\Users\user\Claude\Delphi`) — the synthetic **wind tunnel**
+- **Delphi** (sibling repo `delphi`) — the synthetic **wind tunnel**
   (its own `summary.md` is the authority on everything below attributed to it).
-- **Pythia** (`C:\Users\user\Claude\Pythia`, this repo) — the live real-ETF
+- **Pythia** (this repo) — the live real-ETF
   **test flight**. Never spend a Pythia-week on something Delphi can reject for
   $0.50; conversely, only Pythia's forward record is evidence that counts.
 
